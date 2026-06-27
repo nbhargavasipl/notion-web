@@ -1,17 +1,63 @@
 "use client";
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { createClient } from "@/lib/supabase/client";
 
 export default function SignupPage() {
+  const router = useRouter();
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [checkEmail, setCheckEmail] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // TODO: Supabase auth
-    alert("Auth integration coming soon");
+    setError("");
+    setLoading(true);
+
+    const supabase = createClient();
+    const { error, data } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { name },
+        emailRedirectTo: `${location.origin}/auth/callback`,
+      },
+    });
+
+    if (error) {
+      setError(error.message);
+      setLoading(false);
+      return;
+    }
+
+    // If email confirmation is disabled in Supabase, user is signed in immediately
+    if (data.session) {
+      router.push("/dashboard");
+      router.refresh();
+    } else {
+      setCheckEmail(true);
+      setLoading(false);
+    }
   };
+
+  if (checkEmail) {
+    return (
+      <main className="min-h-screen bg-black text-white flex items-center justify-center px-6">
+        <div className="w-full max-w-sm text-center">
+          <div className="text-4xl mb-4">📬</div>
+          <h1 className="text-2xl font-bold mb-2">Check your email</h1>
+          <p className="text-gray-500 text-sm">
+            We sent a confirmation link to <strong className="text-white">{email}</strong>.
+            Click it to activate your account.
+          </p>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-black text-white flex items-center justify-center px-6">
@@ -54,11 +100,17 @@ export default function SignupPage() {
               minLength={8}
             />
           </div>
+
+          {error && (
+            <p className="text-red-400 text-sm">{error}</p>
+          )}
+
           <button
             type="submit"
-            className="bg-white text-black rounded-lg py-2.5 font-semibold text-sm hover:bg-gray-100 transition mt-2"
+            disabled={loading}
+            className="bg-white text-black rounded-lg py-2.5 font-semibold text-sm hover:bg-gray-100 transition mt-2 disabled:opacity-50"
           >
-            Create account
+            {loading ? "Creating account…" : "Create account"}
           </button>
         </form>
 
