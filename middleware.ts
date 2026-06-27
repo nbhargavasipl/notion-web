@@ -1,47 +1,28 @@
-import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
-export async function middleware(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request })
+const PROTECTED  = ['/dashboard', '/history', '/settings']
+const AUTH_PAGES = ['/login', '/signup']
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
-          supabaseResponse = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
+export function middleware(request: NextRequest) {
+  const session    = request.cookies.get('__session')?.value
+  const { pathname } = request.nextUrl
 
-  const { data: { user } } = await supabase.auth.getUser()
+  const isProtected = PROTECTED.some(p => pathname.startsWith(p))
+  const isAuthPage  = AUTH_PAGES.includes(pathname)
 
-  const PROTECTED = ['/dashboard', '/history', '/settings']
-  const isProtected = PROTECTED.some(p => request.nextUrl.pathname.startsWith(p))
-  const isAuthPage = ['/login', '/signup'].includes(request.nextUrl.pathname)
-
-  if (isProtected && !user) {
+  if (isProtected && !session) {
     return NextResponse.redirect(new URL('/login', request.url))
   }
 
-  if (isAuthPage && user) {
+  if (isAuthPage && session) {
     return NextResponse.redirect(new URL('/dashboard', request.url))
   }
 
-  return supabaseResponse
+  return NextResponse.next()
 }
 
 export const config = {
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    '/((?!_next/static|_next/image|favicon.ico|api/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }

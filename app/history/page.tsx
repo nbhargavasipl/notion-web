@@ -1,14 +1,14 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getSession } from "@/lib/firebase/session";
+import { adminDb } from "@/lib/firebase/admin";
 import AppNav from "@/components/AppNav";
 
 export default async function HistoryPage() {
-  const supabase = createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const user = await getSession();
   if (!user) redirect("/login");
 
-  const name: string = user.user_metadata?.name ?? user.email ?? "User";
+  const userDoc = await adminDb.collection("users").doc(user.uid).get();
+  const name: string = userDoc.data()?.name || user.email || "User";
 
   return (
     <>

@@ -2,16 +2,10 @@
 import { useState, useTransition } from "react";
 import { rotateApiKey } from "@/app/actions";
 
-export default function ApiKeyCard({
-  initialKey,
-  userId,
-}: {
-  initialKey: string;
-  userId: string;
-}) {
-  const [apiKey, setApiKey] = useState(initialKey);
+export default function ApiKeyCard({ initialKey }: { initialKey: string }) {
+  const [apiKey,   setApiKey]   = useState(initialKey);
   const [revealed, setRevealed] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copied,   setCopied]   = useState(false);
   const [isPending, startTransition] = useTransition();
 
   const displayKey = revealed
@@ -27,11 +21,8 @@ export default function ApiKeyCard({
   const handleRotate = () => {
     if (!confirm("This will invalidate your current key. Continue?")) return;
     startTransition(async () => {
-      const newKey = await rotateApiKey(userId);
-      if (newKey) {
-        setApiKey(newKey);
-        setRevealed(true);
-      }
+      const newKey = await rotateApiKey();
+      if (newKey) { setApiKey(newKey); setRevealed(true); }
     });
   };
 
@@ -45,24 +36,17 @@ export default function ApiKeyCard({
         <code className="flex-1 bg-black border border-gray-800 rounded-lg px-4 py-2.5 text-sm text-gray-400 font-mono truncate">
           {displayKey}
         </code>
-        <button
-          onClick={() => setRevealed(!revealed)}
-          className="bg-gray-800 hover:bg-gray-700 text-white text-sm px-4 py-2.5 rounded-lg transition whitespace-nowrap"
-        >
+        <button onClick={() => setRevealed(!revealed)}
+          className="bg-gray-800 hover:bg-gray-700 text-white text-sm px-4 py-2.5 rounded-lg transition whitespace-nowrap">
           {revealed ? "Hide" : "Reveal"}
         </button>
-        <button
-          onClick={handleCopy}
-          className="bg-gray-800 hover:bg-gray-700 text-white text-sm px-4 py-2.5 rounded-lg transition whitespace-nowrap"
-        >
+        <button onClick={handleCopy}
+          className="bg-gray-800 hover:bg-gray-700 text-white text-sm px-4 py-2.5 rounded-lg transition whitespace-nowrap">
           {copied ? "Copied!" : "Copy"}
         </button>
       </div>
-      <button
-        onClick={handleRotate}
-        disabled={isPending}
-        className="text-gray-500 hover:text-red-400 text-xs transition disabled:opacity-50"
-      >
+      <button onClick={handleRotate} disabled={isPending}
+        className="text-gray-500 hover:text-red-400 text-xs transition disabled:opacity-50">
         {isPending ? "Rotating…" : "Rotate key"}
       </button>
     </div>

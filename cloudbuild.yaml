@@ -1,0 +1,40 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - build
+    - --build-arg
+    - NEXT_PUBLIC_FIREBASE_API_KEY=$_FIREBASE_API_KEY
+    - --build-arg
+    - NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=$_FIREBASE_AUTH_DOMAIN
+    - --build-arg
+    - NEXT_PUBLIC_FIREBASE_PROJECT_ID=$PROJECT_ID
+    - --build-arg
+    - NEXT_PUBLIC_FIREBASE_APP_ID=$_FIREBASE_APP_ID
+    - -t
+    - asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/notion-web:$COMMIT_SHA
+    - .
+
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - push
+    - asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/notion-web:$COMMIT_SHA
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+    - run
+    - deploy
+    - notion-web
+    - --image
+    - asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/notion-web:$COMMIT_SHA
+    - --region
+    - asia-south1
+    - --platform
+    - managed
+    - --allow-unauthenticated
+
+images:
+  - asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/notion-web:$COMMIT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY

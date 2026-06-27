@@ -1,16 +1,16 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getSession } from "@/lib/firebase/session";
+import { adminDb } from "@/lib/firebase/admin";
 import AppNav from "@/components/AppNav";
 import SettingsForm from "@/components/SettingsForm";
 
 export default async function SettingsPage() {
-  const supabase = createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-
+  const user = await getSession();
   if (!user) redirect("/login");
 
-  const name: string = user.user_metadata?.name ?? "";
-  const email: string = user.email ?? "";
+  const userDoc = await adminDb.collection("users").doc(user.uid).get();
+  const name:  string = userDoc.data()?.name  || "";
+  const email: string = userDoc.data()?.email || user.email || "";
 
   return (
     <>
