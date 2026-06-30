@@ -19,6 +19,7 @@
 # misc
 .DS_Store
 *.pem
+sa-key.json
 
 # debug
 npm-debug.log*

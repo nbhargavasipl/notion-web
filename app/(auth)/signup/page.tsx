@@ -39,7 +39,7 @@ export default function SignupPage() {
           ? "An account with that email already exists."
           : code === "auth/weak-password"
           ? "Password must be at least 6 characters."
-          : "Something went wrong. Please try again.";
+          : `Error: ${code ?? (err as Error).message}`;
       setError(msg);
       setLoading(false);
     }

@@ -6,6 +6,7 @@ import { auth } from "@/lib/firebase/client";
 
 const LINKS = [
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/try",       label: "Try it"    },
   { href: "/history",   label: "History"   },
   { href: "/settings",  label: "Settings"  },
 ];

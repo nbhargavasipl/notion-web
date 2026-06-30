@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server'
 
 const PROTECTED  = ['/dashboard', '/history', '/settings']
 const AUTH_PAGES = ['/login', '/signup']
+// /try is intentionally public — no session required
 
 export function middleware(request: NextRequest) {
   const session    = request.cookies.get('__session')?.value
