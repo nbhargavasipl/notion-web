@@ -12,12 +12,28 @@ export interface ActionItem {
   completed: boolean;
 }
 
+export interface DiarizationSegment {
+  speaker: string;
+  start_time: number;
+  end_time: number;
+  original_text: string;
+  translated_text: string;
+}
+
 export interface RecordingResult {
   timestamp: number;
   input_language: string;
   translated_transcript: string;
   confidence: number | null;
   low_confidence: boolean;
+  segments?: DiarizationSegment[];
+  // Backward-compatible metadata — absent on records saved before this was added
+  recordingMode?: "mic_and_meeting" | "mic_only";
+  microphoneCaptured?: boolean;
+  meetingAudioCaptured?: boolean;
+  meetingAudioEndedDuringRecording?: boolean;
+  mimeType?: string;
+  durationSeconds?: number;
 }
 
 export interface TimelineEvent {
@@ -40,6 +56,7 @@ export interface MeetingLocalData {
   openQuestions: string[];
   risks: string[];
   recording: RecordingResult | null;
+  aiSummary: { execSummary: string; topics: string[]; actions: string[]; questions: string[]; risks: string[] } | null;
   timeline: TimelineEvent[];
   isPinned: boolean;
   tags: string[];
@@ -66,6 +83,7 @@ export function loadMeetingData(eventId: string): MeetingLocalData {
     openQuestions: [],
     risks: [],
     recording: null,
+    aiSummary: null,
     timeline: [{ id: String(now), type: 'created', description: 'Meeting workspace opened', timestamp: now }],
     isPinned: false,
     tags: [],
