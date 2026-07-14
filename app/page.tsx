@@ -4,11 +4,11 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-black text-white flex flex-col items-center justify-center px-6">
       <div className="max-w-2xl w-full text-center">
-        <h1 className="text-5xl font-bold mb-6 tracking-tight">Notion</h1>
+        <h1 className="text-5xl font-bold mb-6 tracking-tight">MOSAIC</h1>
         <p className="text-xl text-gray-400 mb-10 leading-relaxed">
           AI-powered audio transcription for Indian languages.
           Upload a recording or transcribe live meetings — get an instant
-          transcript in the original language and English.
+          English transcript in seconds.
         </p>
         <div className="flex gap-4 justify-center">
           <Link

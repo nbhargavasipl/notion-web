@@ -1,8 +1,10 @@
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import { getSession } from "@/lib/firebase/session";
 import { adminDb } from "@/lib/firebase/admin";
 import AppNav from "@/components/AppNav";
 import ApiKeyCard from "@/components/ApiKeyCard";
+import MeetingsView from "@/components/MeetingsView";
 
 export default async function DashboardPage() {
   const user = await getSession();
@@ -44,18 +46,15 @@ export default async function DashboardPage() {
             </div>
           )}
 
+          {/* Today's meetings */}
           <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-            <h2 className="font-semibold mb-1">Desktop App</h2>
-            <p className="text-gray-500 text-sm mb-4">
-              Download the desktop app to transcribe audio files.
-            </p>
-            <div className="flex gap-3 flex-wrap">
-              {["macOS", "Windows", "Linux"].map((os) => (
-                <button key={os} className="bg-white text-black text-sm font-semibold px-5 py-2 rounded-lg hover:bg-gray-100 transition">
-                  Download for {os}
-                </button>
-              ))}
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="font-semibold">Today&apos;s Meetings</h2>
+              <Link href="/meetings" className="text-gray-500 hover:text-white text-xs transition">
+                View all →
+              </Link>
             </div>
+            <MeetingsView />
           </div>
         </div>
       </main>

@@ -6,7 +6,7 @@ export default function TryPage() {
     <main className="min-h-screen bg-black text-white">
       {/* Top bar */}
       <nav className="border-b border-gray-800 px-8 py-4 flex items-center justify-between">
-        <span className="font-bold tracking-tight">Notion</span>
+        <span className="font-bold tracking-tight">MOSAIC</span>
         <div className="flex gap-3">
           <Link href="/login"
             className="text-gray-400 hover:text-white text-sm transition px-3 py-1.5">
@@ -22,10 +22,10 @@ export default function TryPage() {
       <div className="max-w-4xl mx-auto px-8 py-12">
         {/* Hero */}
         <div className="text-center mb-10">
-          <h1 className="text-4xl font-bold mb-3">Try Notion for free</h1>
+          <h1 className="text-4xl font-bold mb-3">Try MOSAIC for free</h1>
           <p className="text-gray-400 text-lg max-w-xl mx-auto">
-            Upload any audio in an Indian language — get the original transcript
-            and English translation instantly. No account needed.
+            Upload any audio in an Indian language — get an instant
+            English transcript. No account needed.
           </p>
         </div>
 
@@ -38,7 +38,7 @@ export default function TryPage() {
                 "Up to 30 seconds of audio per upload",
                 "Automatic language detection",
                 "8 Indian languages: Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Gujarati, Marathi",
-                "Translation to English or any other language",
+                "English transcript output",
                 "Confidence score",
               ].map((item) => (
                 <li key={item} className="flex gap-3 text-sm text-gray-300">
@@ -80,7 +80,7 @@ export default function TryPage() {
             {[
               { step: "1", title: "Upload audio", desc: "Select a WAV, MP3, M4A, OGG or FLAC file up to 3 MB (≈ 30 seconds)." },
               { step: "2", title: "Auto-detect language", desc: "The AI identifies which of 8 Indian languages is spoken — no need to set it manually." },
-              { step: "3", title: "Get transcripts", desc: "See the original transcript alongside the English (or your chosen language) translation side by side." },
+              { step: "3", title: "Get transcript", desc: "Get the full English transcript instantly — no language selection needed." },
             ].map((s) => (
               <div key={s.step} className="bg-gray-900 rounded-xl p-5 border border-gray-800">
                 <div className="text-2xl font-bold text-gray-600 mb-2">{s.step}</div>

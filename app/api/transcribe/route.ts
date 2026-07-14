@@ -15,15 +15,23 @@ export async function POST(request: Request) {
     )
   }
 
-  const formData   = await request.formData()
-  const targetLang = formData.get('target_language') as string || 'en'
+  const formData = await request.formData()
 
-  const upstream = await fetch(`${apiUrl.replace(/\/$/, '')}/?target_language=${targetLang}`, {
-    method:  'POST',
-    headers: { 'X-API-Key': apiKey },
-    body:    formData,
-  })
+  // Diarization (SpeakerDiarizationConfig) is incompatible with the Chirp 2 model —
+  // sending it causes the Speech API to return INTERNAL_ERROR. Keep it off.
+  const upstream = await fetch(
+    `${apiUrl.replace(/\/$/, '')}/?target_language=en`,
+    { method: 'POST', headers: { 'X-API-Key': apiKey }, body: formData }
+  )
 
-  const data = await upstream.json()
+  let data: unknown
+  try {
+    data = await upstream.json()
+  } catch {
+    return NextResponse.json(
+      { success: false, error: `Transcription service error (HTTP ${upstream.status})` },
+      { status: 502 }
+    )
+  }
   return NextResponse.json(data, { status: upstream.status })
 }

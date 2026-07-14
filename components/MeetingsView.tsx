@@ -1,6 +1,8 @@
 "use client";
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { signInWithPopup, GoogleAuthProvider } from "firebase/auth";
+import { auth, createGoogleProvider } from "@/lib/firebase/client";
 import {
   CalendarEvent, fetchUpcomingMeetings, detectPlatform,
   fmtEventTime, fmtDuration, isOngoing, isUpcoming,
@@ -28,21 +30,37 @@ function avatarInitials(email: string, name?: string): string {
 
 export default function MeetingsView() {
   const router = useRouter();
-  const [events,    setEvents]    = useState<CalendarEvent[]>([]);
-  const [syncing,   setSyncing]   = useState(true);
-  const [syncError, setSyncError] = useState<string | null>(null);
-  const [token,     setToken]     = useState<string | null>(null);
+  const [events,      setEvents]      = useState<CalendarEvent[]>([]);
+  const [syncing,     setSyncing]     = useState(true);
+  const [syncError,   setSyncError]   = useState<string | null>(null);
+  const [token,       setToken]       = useState<string | null>(null);
+  const [refreshing,  setRefreshing]  = useState(false);
+  const [tokenExpired, setTokenExpired] = useState(false);
 
   useEffect(() => {
-    const t = localStorage.getItem("googleCalendarToken");
+    const t      = localStorage.getItem("googleCalendarToken");
+    const expiry = Number(localStorage.getItem("googleCalendarTokenExpiry") || "0");
     setToken(t);
-    if (t) {
-      syncCalendar(t);
-      const id = setInterval(() => syncCalendar(t), 60_000);
-      return () => clearInterval(id);
-    } else {
+
+    if (!t) { setSyncing(false); return; }
+
+    if (expiry && Date.now() > expiry) {
+      setTokenExpired(true);
       setSyncing(false);
+      return;
     }
+
+    syncCalendar(t);
+    const id = setInterval(() => {
+      const exp = Number(localStorage.getItem("googleCalendarTokenExpiry") || "0");
+      if (exp && Date.now() > exp) {
+        setTokenExpired(true);
+        clearInterval(id);
+      } else {
+        syncCalendar(t);
+      }
+    }, 60_000);
+    return () => clearInterval(id);
   }, []);
 
   const syncCalendar = async (t: string) => {
@@ -51,12 +69,38 @@ export default function MeetingsView() {
       const list = await fetchUpcomingMeetings(t);
       setEvents(list);
       setSyncError(null);
-    } catch (e: any) {
-      setSyncError(e.message === "TOKEN_EXPIRED"
-        ? "Session expired — sign out and sign in again."
-        : e.message);
+      setTokenExpired(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "TOKEN_EXPIRED") {
+        setTokenExpired(true);
+      } else {
+        setSyncError(msg);
+      }
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handleRefreshToken = async () => {
+    setRefreshing(true);
+    try {
+      const result = await signInWithPopup(auth, createGoogleProvider());
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        localStorage.setItem("googleCalendarToken", credential.accessToken);
+        localStorage.setItem("googleCalendarTokenExpiry", String(Date.now() + 3540 * 1000));
+        setToken(credential.accessToken);
+        setTokenExpired(false);
+        await syncCalendar(credential.accessToken);
+      }
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code;
+      if (code !== "auth/popup-closed-by-user") {
+        setSyncError("Could not refresh calendar access. Please sign out and sign in again.");
+      }
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -101,7 +145,20 @@ export default function MeetingsView() {
         </div>
       </div>
 
-      {syncError && (
+      {tokenExpired && (
+        <div className="bg-yellow-950/40 border border-yellow-800/40 rounded-lg px-4 py-3 text-yellow-400 text-sm flex items-center justify-between gap-4">
+          <span>Calendar access expired.</span>
+          <button
+            onClick={handleRefreshToken}
+            disabled={refreshing}
+            className="text-yellow-300 font-semibold text-xs underline underline-offset-2 hover:text-yellow-200 transition disabled:opacity-50"
+          >
+            {refreshing ? "Refreshing…" : "Refresh now"}
+          </button>
+        </div>
+      )}
+
+      {syncError && !tokenExpired && (
         <div className="bg-red-950/40 border border-red-800/40 rounded-lg px-4 py-3 text-red-400 text-sm">
           {syncError}
         </div>

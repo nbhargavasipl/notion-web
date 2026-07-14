@@ -14,8 +14,8 @@ const geistMono = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "Notion — Audio Transcription",
-  description: "Transcribe and translate audio across Indian languages",
+  title: "MOSAIC — Audio Transcription",
+  description: "Transcribe audio across Indian languages instantly in English",
 };
 
 export default function RootLayout({

@@ -10,8 +10,8 @@ import {
   RecordingResult, DiarizationSegment, loadMeetingData, saveMeetingData,
   addTimelineEvent, parseSummary,
 } from "@/lib/meetingStorage";
-import { auth } from "@/lib/firebase/client";
 import { syncMeetingToFirestore, loadMeetingFromFirestore } from "@/lib/firestoreSync";
+import { auth } from "@/lib/firebase/client";
 
 // ── Recording types ────────────────────────────────────────────────────────────
 type RecordingMode    = "mic_and_meeting" | "mic_only";
@@ -19,6 +19,8 @@ type AudioSourceStatus = "idle" | "connected" | "muted" | "not_shared" | "no_aud
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const MEETING_TYPES = ["General", "Standup", "Client Meeting", "Sprint Review", "Planning", "Retrospective", "1:1", "Interview", "Workshop", "Demo"];
+// 5-minute segments keep each webm blob well under the transcription service's 9 MB limit.
+const CHUNK_SECS = 5 * 60;
 
 const PLATFORM_COLORS: Record<string, string> = {
   "Google Meet":     "#4ade80",
@@ -58,6 +60,7 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   const [micLevel,               setMicLevel]               = useState(0);
   const [meetingLevel,           setMeetingLevel]           = useState(0);
   const [recWarning,             setRecWarning]             = useState<string | null>(null);
+  const [chunkProgress,          setChunkProgress]          = useState<{ done: number; total: number } | null>(null);
 
   const mediaRef             = useRef<MediaRecorder | null>(null);
   const chunks               = useRef<Blob[]>([]);
@@ -76,6 +79,13 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   const trackCleanupFnsRef   = useRef<Array<() => void>>([]);
   const meetingEndedRef      = useRef(false);
   const isSettingUpRef       = useRef(false);
+  // Chunked-recording refs
+  const isFinalStopRef       = useRef(false);
+  const chunkRotateTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chunkResultsRef      = useRef<Map<number, { text: string; lang: string; conf: number | null; low: boolean }>>(new Map());
+  const pendingChunksRef     = useRef(0);
+  const totalSegmentsRef     = useRef(0);
+  const chunkGcsPathsRef     = useRef<Map<number, string>>(new Map());
 
   // ── Load event + data ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -89,40 +99,45 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       });
     }
 
+    // Seed UI from localStorage immediately to avoid blank flash during Firestore load
     const local = loadMeetingData(eventId);
     setData(local);
     if (local.recording) { setTranscript(local.recording); setRecStatus("done"); }
-    setLoading(false);
 
-    // Merge Firestore data — wins if newer than what's in localStorage
     const uid = auth.currentUser?.uid;
-    if (uid) {
-      loadMeetingFromFirestore(uid, eventId).then(remote => {
-        if (!remote) return;
-        setData(prev => {
-          if (!prev) return prev;
-          if (remote.createdAt <= prev.createdAt && prev.recording === remote.recording) return prev;
-          const merged: MeetingLocalData = remote.createdAt > prev.createdAt ? remote : {
-            ...prev,
-            recording: remote.recording ?? prev.recording,
-            aiSummary: remote.aiSummary ?? prev.aiSummary,
-            notes:     remote.notes || prev.notes,
-            actionItems: remote.actionItems.length > prev.actionItems.length ? remote.actionItems : prev.actionItems,
-          };
-          saveMeetingData(merged);
-          if (merged.recording) { setTranscript(merged.recording); setRecStatus("done"); }
-          return merged;
-        });
-      }).catch(() => {});
-    }
+    if (!uid) { setLoading(false); return; }
+
+    // Firestore is primary — setLoading(false) only after it resolves or fails
+    loadMeetingFromFirestore(uid, eventId).then(remote => {
+      if (!remote) {
+        // New meeting — push local seed to Firestore
+        syncMeetingToFirestore(uid, local).catch(() => {});
+        return;
+      }
+      // Merge: Firestore wins on most fields; prefer whichever has more content
+      const merged: MeetingLocalData = {
+        ...local,
+        ...remote,
+        recording:   remote.recording   ?? local.recording,
+        aiSummary:   remote.aiSummary   ?? local.aiSummary,
+        notes:       remote.notes.length >= local.notes.length ? remote.notes : local.notes,
+        actionItems: remote.actionItems.length >= local.actionItems.length ? remote.actionItems : local.actionItems,
+      };
+      saveMeetingData(merged); // update localStorage cache
+      setData(merged);
+      if (merged.recording) { setTranscript(merged.recording); setRecStatus("done"); }
+    }).catch(() => {
+      // Offline or error — localStorage seed already visible, just continue
+    }).finally(() => setLoading(false));
   }, [eventId]);
 
   // ── Cleanup on unmount ──────────────────────────────────────────────────────
   useEffect(() => {
     return () => {
-      if (levelTimerRef.current)  clearInterval(levelTimerRef.current);
-      if (timerRef.current)       clearInterval(timerRef.current);
-      if (saveTimer.current)      clearTimeout(saveTimer.current);
+      if (levelTimerRef.current)       clearInterval(levelTimerRef.current);
+      if (timerRef.current)            clearInterval(timerRef.current);
+      if (saveTimer.current)           clearTimeout(saveTimer.current);
+      if (chunkRotateTimerRef.current) clearInterval(chunkRotateTimerRef.current);
       trackCleanupFnsRef.current.forEach(fn => fn());
       displayRef.current?.getTracks().forEach(t => t.stop());
       streamRef.current?.getTracks().forEach(t => t.stop());
@@ -131,18 +146,23 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   }, []);
 
   // ── Auto-save ───────────────────────────────────────────────────────────────
-  const fireSync = (data: MeetingLocalData) => {
-    const uid = auth.currentUser?.uid;
-    if (uid) syncMeetingToFirestore(uid, data).catch(() => {});
-  };
-
   const update = useCallback((patch: Partial<MeetingLocalData>) => {
     setData(prev => {
       if (!prev) return prev;
       const next = { ...prev, ...patch };
       setSaved(false);
       if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => { saveMeetingData(next); setSaved(true); fireSync(next); }, 800);
+      saveTimer.current = setTimeout(() => {
+        const uid = auth.currentUser?.uid;
+        if (uid) {
+          syncMeetingToFirestore(uid, next)
+            .then(() => { saveMeetingData(next); setSaved(true); })
+            .catch(() => { saveMeetingData(next); setSaved(true); });
+        } else {
+          saveMeetingData(next);
+          setSaved(true);
+        }
+      }, 800);
       return next;
     });
   }, []);
@@ -151,8 +171,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
     setData(prev => {
       if (!prev) return prev;
       const next = addTimelineEvent(prev, type, description);
-      saveMeetingData(next);
-      fireSync(next);
+      const uid = auth.currentUser?.uid;
+      if (uid) syncMeetingToFirestore(uid, next).catch(() => {});
+      saveMeetingData(next); // local cache in parallel
       return next;
     });
   }, []);
@@ -163,8 +184,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   // Does NOT stop tracks or close AudioContext — those must stay alive until
   // MediaRecorder.onstop fires so the final audio chunk is not cut short.
   const cleanupMonitoring = useCallback(() => {
-    if (levelTimerRef.current)  { clearInterval(levelTimerRef.current);  levelTimerRef.current  = null; }
-    if (timerRef.current)       { clearInterval(timerRef.current);       timerRef.current       = null; }
+    if (levelTimerRef.current)       { clearInterval(levelTimerRef.current);       levelTimerRef.current       = null; }
+    if (timerRef.current)            { clearInterval(timerRef.current);            timerRef.current            = null; }
+    if (chunkRotateTimerRef.current) { clearInterval(chunkRotateTimerRef.current); chunkRotateTimerRef.current = null; }
     trackCleanupFnsRef.current.forEach(fn => fn());
     trackCleanupFnsRef.current = [];
     setMicLevel(0);
@@ -177,7 +199,13 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
 
     cleanupMonitoring();
     meetingEndedRef.current = false;
+    isFinalStopRef.current = false;
     chunks.current = [];
+    chunkResultsRef.current = new Map();
+    chunkGcsPathsRef.current = new Map();
+    pendingChunksRef.current = 0;
+    totalSegmentsRef.current = 0;
+    setChunkProgress(null);
     setRecError(null);
     setRecWarning(null);
     setMicStatus("idle");
@@ -321,24 +349,151 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
 
       setRecordingMode(mode);
 
-      // ── MediaRecorder ────────────────────────────────────────────────────────
+      // ── MediaRecorder — chunked to stay under the 9 MB transcription limit ──
       const mimeTypes = ["audio/webm;codecs=opus", "audio/webm", "video/webm;codecs=opus", "video/webm"];
       const mime = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) ?? "";
+      const blobType = mime || "audio/webm";
 
-      const mr = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
-      mediaRef.current = mr;
-      mr.ondataavailable = e => { if (e.data.size > 0) chunks.current.push(e.data); };
-      mr.onstop = () => {
-        // Stop ALL tracks only after the recorder has flushed its final chunk.
-        // Stopping the display video track early kills display-capture audio in Chrome.
-        displayRef.current?.getTracks().forEach(t => t.stop());
-        streamRef.current?.getTracks().forEach(t => t.stop());
-        displayRef.current = null;
-        streamRef.current  = null;
-        ctx?.close().catch(() => {});
-        uploadRecording(eventId, mode, mime);
+      // Upload one chunk blob directly to GCS via a server-issued signed URL.
+      // Runs in parallel with transcription — failure is non-fatal.
+      const uploadChunkToGcs = async (blob: Blob, chunkIndex: number) => {
+        try {
+          const res = await fetch("/api/recordings/signed-url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ meetingId: eventId, chunkIndex, mimeType: blobType }),
+          });
+          if (!res.ok) return;
+          const { uploadUrl, gcsPath } = await res.json() as { uploadUrl: string; gcsPath: string };
+          await fetch(uploadUrl, { method: "PUT", headers: { "Content-Type": blobType }, body: blob });
+          chunkGcsPathsRef.current.set(chunkIndex, gcsPath);
+        } catch {
+          console.warn(`GCS upload failed for chunk ${chunkIndex}`);
+        }
       };
-      mr.start(1000);
+
+      // Build the final RecordingResult from all collected chunk transcripts.
+      const finalizeCombined = () => {
+        const indices = Array.from(chunkResultsRef.current.keys()).sort((a, b) => a - b);
+        if (indices.length === 0) {
+          setRecStatus("error");
+          setRecError("No audio was captured. Try recording again.");
+          return;
+        }
+        const first    = chunkResultsRef.current.get(indices[0])!;
+        const combined = indices.map(i => chunkResultsRef.current.get(i)!.text).join("\n\n");
+        const confs    = indices.map(i => chunkResultsRef.current.get(i)!.conf).filter((c): c is number => c !== null);
+        const avgConf  = confs.length > 0 ? confs.reduce((a, b) => a + b, 0) / confs.length : null;
+        const anyLow   = indices.some(i => chunkResultsRef.current.get(i)!.low);
+        const gcsPaths = indices.map(i => chunkGcsPathsRef.current.get(i)).filter((p): p is string => p !== undefined);
+
+        const result: RecordingResult = {
+          translated_transcript: combined,
+          input_language: first.lang,
+          confidence: avgConf,
+          low_confidence: anyLow,
+          timestamp: Date.now(),
+          recordingMode: mode,
+          microphoneCaptured: true,
+          meetingAudioCaptured: mode === "mic_and_meeting",
+          meetingAudioEndedDuringRecording: meetingEndedRef.current,
+          mimeType: blobType,
+          chunkGcsPaths: gcsPaths.length > 0 ? gcsPaths : undefined,
+          audioGcsBucket: gcsPaths.length > 0 ? (process.env.NEXT_PUBLIC_GCS_RECORDINGS_BUCKET || undefined) : undefined,
+        };
+        setTranscript(result);
+        setRecStatus("done");
+        setChunkProgress(null);
+        setData(prev => {
+          if (!prev) return prev;
+          const next = addTimelineEvent({ ...prev, recording: result }, "recording_done", "Recording completed and transcribed");
+          const uid = auth.currentUser?.uid;
+          if (uid) {
+            syncMeetingToFirestore(uid, next)
+              .then(() => saveMeetingData(next))
+              .catch(() => saveMeetingData(next));
+          } else {
+            saveMeetingData(next);
+          }
+          return next;
+        });
+      };
+
+      // Transcribe one chunk. GCS upload runs in parallel (fire-and-forget).
+      const transcribeChunk = async (blob: Blob, chunkIndex: number) => {
+        pendingChunksRef.current++;
+        uploadChunkToGcs(blob, chunkIndex); // parallel, non-blocking
+        try {
+          const form = new FormData();
+          form.append("file", new File([blob], `chunk-${chunkIndex}.webm`, { type: blobType }));
+          const res  = await fetch("/api/transcribe", { method: "POST", body: form });
+          const json = await res.json();
+          if (json.success !== false) {
+            chunkResultsRef.current.set(chunkIndex, {
+              text: json.translated_transcript ?? "",
+              lang: json.input_language ?? "Unknown",
+              conf: json.confidence ?? null,
+              low:  !!json.low_confidence,
+            });
+          } else {
+            chunkResultsRef.current.set(chunkIndex, {
+              text: `[Part ${chunkIndex + 1} failed: ${json.message || json.error || "unknown error"}]`,
+              lang: "Unknown", conf: null, low: false,
+            });
+          }
+        } catch {
+          chunkResultsRef.current.set(chunkIndex, {
+            text: `[Part ${chunkIndex + 1} unavailable]`,
+            lang: "Unknown", conf: null, low: false,
+          });
+        } finally {
+          pendingChunksRef.current--;
+          setChunkProgress({ done: chunkResultsRef.current.size, total: totalSegmentsRef.current });
+          if (isFinalStopRef.current && pendingChunksRef.current === 0) finalizeCombined();
+        }
+      };
+
+      // Start a new MediaRecorder segment. On rotation, the next segment starts
+      // before transcribing the current one so no audio is lost.
+      const startSegment = (chunkIndex: number) => {
+        chunks.current = [];
+        totalSegmentsRef.current++;
+        const mr = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
+        mediaRef.current = mr;
+        mr.ondataavailable = e => { if (e.data.size > 0) chunks.current.push(e.data); };
+        mr.onstop = () => {
+          const blob = new Blob(chunks.current, { type: blobType });
+          const isFinal = isFinalStopRef.current;
+
+          if (isFinal) {
+            // Close audio infrastructure only after the final segment flushes.
+            // Stopping video tracks early kills Chrome's display-capture audio session.
+            displayRef.current?.getTracks().forEach(t => t.stop());
+            streamRef.current?.getTracks().forEach(t => t.stop());
+            displayRef.current = null;
+            streamRef.current  = null;
+            ctx?.close().catch(() => {});
+            audioCtxRef.current  = null;
+            audioDestRef.current = null;
+          } else {
+            startSegment(chunkIndex + 1);
+          }
+
+          if (blob.size > 0) {
+            transcribeChunk(blob, chunkIndex);
+          } else if (isFinal && pendingChunksRef.current === 0) {
+            finalizeCombined();
+          }
+        };
+        mr.start(1000);
+      };
+
+      startSegment(0);
+
+      // Rotate the recorder every CHUNK_SECS to keep blobs under the 9 MB API limit.
+      chunkRotateTimerRef.current = setInterval(() => {
+        if (mediaRef.current?.state === "recording") mediaRef.current.stop();
+      }, CHUNK_SECS * 1000);
 
       // Live level monitoring (~10 fps — avoids 60-fps re-render flood)
       levelTimerRef.current = setInterval(() => {
@@ -379,8 +534,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   };
 
   const stopRecording = () => {
-    cleanupMonitoring();
-    mediaRef.current?.stop(); // onstop handles tracks, AudioContext, and upload
+    cleanupMonitoring(); // stops timers + rotation timer
+    isFinalStopRef.current = true;
+    mediaRef.current?.stop(); // onstop handles tracks, AudioContext, and transcription
     setRecStatus("processing");
   };
 
@@ -451,44 +607,20 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
     }
   };
 
-  const uploadRecording = async (id: string, mode: RecordingMode, mimeType?: string) => {
-    try {
-      if (chunks.current.length === 0) throw new Error("No audio was captured. Try recording again.");
-      const blobType = mimeType || "audio/webm";
-      const blob = new Blob(chunks.current, { type: blobType });
-      const form = new FormData();
-      form.append("file", new File([blob], `meeting-${id}.webm`, { type: blobType }));
-      const res  = await fetch("/api/transcribe", { method: "POST", body: form });
-      const json = await res.json();
-      if (!json.success) throw new Error(json.message || json.error || `Transcription service error (HTTP ${res.status})`);
-      const result: RecordingResult = {
-        ...json,
-        timestamp: Date.now(),
-        recordingMode: mode,
-        microphoneCaptured: true,
-        meetingAudioCaptured: mode === "mic_and_meeting",
-        meetingAudioEndedDuringRecording: meetingEndedRef.current,
-        mimeType: blobType,
-      };
-      setTranscript(result);
-      setRecStatus("done");
-      setData(prev => {
-        if (!prev) return prev;
-        const next = addTimelineEvent({ ...prev, recording: result }, "recording_done", "Recording completed and transcribed");
-        saveMeetingData(next);
-        fireSync(next);
-        return next;
-      });
-    } catch (e: unknown) {
-      setRecStatus("error");
-      setRecError(e instanceof Error ? (e.message || "Upload failed.") : "Upload failed.");
-    }
-  };
-
   const fmt = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   if (loading || !data) {
-    return <div className="min-h-screen bg-black flex items-center justify-center text-gray-600 text-sm">Loading…</div>;
+    return (
+      <div className="min-h-screen bg-black text-white">
+        <div className="border-b border-gray-800 bg-black sticky top-0 z-10 h-16" />
+        <div className="max-w-2xl mx-auto px-6 py-8 flex flex-col gap-8 animate-pulse">
+          <div className="h-5 bg-gray-800 rounded w-40" />
+          <div className="h-32 bg-gray-900 border border-gray-800 rounded-xl" />
+          <div className="h-48 bg-gray-900 border border-gray-800 rounded-xl" />
+          <div className="h-64 bg-gray-900 border border-gray-800 rounded-xl" />
+        </div>
+      </div>
+    );
   }
 
   const platform   = event ? detectPlatform(event) : "Meeting";
@@ -627,7 +759,11 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
                 </>
               )}
               {recStatus === "processing" && (
-                <span className="text-xs text-yellow-400">Transcribing…</span>
+                <span className="text-xs text-yellow-400">
+                  {chunkProgress && chunkProgress.total > 1
+                    ? `Transcribing… ${chunkProgress.done}/${chunkProgress.total}`
+                    : "Transcribing…"}
+                </span>
               )}
             </div>
           </div>
@@ -762,7 +898,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
             {recStatus === "processing" && (
               <div className="flex items-center gap-3 text-sm text-gray-400">
                 <span className="animate-spin inline-block">⟳</span>
-                Transcribing… usually takes 10–30 seconds.
+                {chunkProgress && chunkProgress.total > 1
+                  ? `Transcribing… (${chunkProgress.done}/${chunkProgress.total} segments done)`
+                  : "Transcribing… usually takes 10–30 seconds."}
               </div>
             )}
             {recStatus === "done" && transcript && (

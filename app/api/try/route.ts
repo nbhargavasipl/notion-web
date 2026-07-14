@@ -10,9 +10,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Service not configured' }, { status: 503 })
   }
 
-  const formData   = await request.formData()
-  const file       = formData.get('file') as File | null
-  const targetLang = formData.get('target_language') as string || 'en'
+  const formData = await request.formData()
+  const file     = formData.get('file') as File | null
 
   if (!file) {
     return NextResponse.json({ error: 'No file provided' }, { status: 400 })
@@ -25,7 +24,7 @@ export async function POST(request: Request) {
     )
   }
 
-  const upstream = await fetch(`${apiUrl.replace(/\/$/, '')}/?target_language=${targetLang}`, {
+  const upstream = await fetch(`${apiUrl.replace(/\/$/, '')}/?target_language=en`, {
     method:  'POST',
     headers: { 'X-API-Key': apiKey },
     body:    formData,

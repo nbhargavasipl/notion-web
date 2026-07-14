@@ -34,6 +34,9 @@ export interface RecordingResult {
   meetingAudioEndedDuringRecording?: boolean;
   mimeType?: string;
   durationSeconds?: number;
+  // GCS audio storage — absent on records saved before GCS was added
+  chunkGcsPaths?: string[];  // ordered: recordings/{uid}/{meetingId}/chunk-{n}.webm
+  audioGcsBucket?: string;
 }
 
 export interface TimelineEvent {
@@ -107,6 +110,15 @@ export function addTimelineEvent(
       { id: String(Date.now()), type, description, timestamp: Date.now() },
     ],
   };
+}
+
+export function listLocalMeetingIds(): string[] {
+  const ids: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key?.startsWith('mosaic_meeting_')) ids.push(key.slice('mosaic_meeting_'.length));
+  }
+  return ids;
 }
 
 export function parseSummary(text: string) {

@@ -18,6 +18,7 @@ export default function LoginPage() {
       if (credential?.accessToken) {
         localStorage.setItem("googleAccessToken", credential.accessToken);
         localStorage.setItem("googleCalendarToken", credential.accessToken);
+        localStorage.setItem("googleCalendarTokenExpiry", String(Date.now() + 3540 * 1000)); // 59 min
       }
       const idToken = await result.user.getIdToken();
 

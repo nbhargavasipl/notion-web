@@ -3,6 +3,7 @@ import { getSession } from "@/lib/firebase/session";
 import { adminDb } from "@/lib/firebase/admin";
 import AppNav from "@/components/AppNav";
 import SettingsForm from "@/components/SettingsForm";
+import DeleteAccountButton from "@/components/DeleteAccountButton";
 
 export default async function SettingsPage() {
   const user = await getSession();
@@ -34,9 +35,7 @@ export default async function SettingsPage() {
               <p className="text-gray-500 text-sm mb-4">
                 Permanently delete your account and all transcription data.
               </p>
-              <button className="border border-red-800 text-red-400 text-sm font-semibold px-5 py-2 rounded-lg hover:bg-red-950 transition">
-                Delete my account
-              </button>
+              <DeleteAccountButton />
             </section>
           </div>
         </div>
