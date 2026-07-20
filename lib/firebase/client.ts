@@ -23,4 +23,11 @@ export function createGoogleProvider() {
   return provider
 }
 
+export function createGoogleProviderWithConsent() {
+  const provider = new GoogleAuthProvider()
+  provider.addScope('https://www.googleapis.com/auth/calendar.readonly')
+  provider.setCustomParameters({ access_type: 'online', prompt: 'consent' })
+  return provider
+}
+
 export default app

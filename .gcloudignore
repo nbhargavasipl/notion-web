@@ -1,0 +1,7 @@
+# Inherit all patterns from .gitignore
+#!include:.gitignore
+
+# .env.production contains only NEXT_PUBLIC_* Firebase config (no secrets).
+# It must be present during `npm run build` in Cloud Build so Next.js can
+# bake the Firebase client config into the static bundle at build time.
+!.env.production

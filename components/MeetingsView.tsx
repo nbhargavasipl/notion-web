@@ -2,7 +2,7 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { signInWithPopup, GoogleAuthProvider } from "firebase/auth";
-import { auth, createGoogleProvider } from "@/lib/firebase/client";
+import { auth, createGoogleProvider, createGoogleProviderWithConsent } from "@/lib/firebase/client";
 import {
   CalendarEvent, fetchUpcomingMeetings, detectPlatform,
   fmtEventTime, fmtDuration, isOngoing, isUpcoming,
@@ -34,8 +34,9 @@ export default function MeetingsView() {
   const [syncing,     setSyncing]     = useState(true);
   const [syncError,   setSyncError]   = useState<string | null>(null);
   const [token,       setToken]       = useState<string | null>(null);
-  const [refreshing,  setRefreshing]  = useState(false);
-  const [tokenExpired, setTokenExpired] = useState(false);
+  const [refreshing,   setRefreshing]   = useState(false);
+  const [tokenExpired,  setTokenExpired]  = useState(false);
+  const [scopeMissing,  setScopeMissing]  = useState(false);
 
   useEffect(() => {
     const t      = localStorage.getItem("googleCalendarToken");
@@ -74,6 +75,8 @@ export default function MeetingsView() {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg === "TOKEN_EXPIRED") {
         setTokenExpired(true);
+      } else if (msg === "SCOPE_MISSING") {
+        setScopeMissing(true);
       } else {
         setSyncError(msg);
       }
@@ -98,6 +101,29 @@ export default function MeetingsView() {
       const code = (e as { code?: string })?.code;
       if (code !== "auth/popup-closed-by-user") {
         setSyncError("Could not refresh calendar access. Please sign out and sign in again.");
+      }
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleGrantCalendarAccess = async () => {
+    setRefreshing(true);
+    try {
+      const result = await signInWithPopup(auth, createGoogleProviderWithConsent());
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        localStorage.setItem("googleCalendarToken", credential.accessToken);
+        localStorage.setItem("googleCalendarTokenExpiry", String(Date.now() + 3540 * 1000));
+        setToken(credential.accessToken);
+        setScopeMissing(false);
+        setSyncError(null);
+        await syncCalendar(credential.accessToken);
+      }
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code;
+      if (code !== "auth/popup-closed-by-user") {
+        setSyncError("Could not grant calendar access. Please try again.");
       }
     } finally {
       setRefreshing(false);
@@ -145,7 +171,20 @@ export default function MeetingsView() {
         </div>
       </div>
 
-      {tokenExpired && (
+      {scopeMissing && (
+        <div className="bg-yellow-950/40 border border-yellow-800/40 rounded-lg px-4 py-3 text-yellow-400 text-sm flex items-center justify-between gap-4">
+          <span>Calendar permission not granted. Click to allow MOSAIC to read your calendar.</span>
+          <button
+            onClick={handleGrantCalendarAccess}
+            disabled={refreshing}
+            className="text-yellow-300 font-semibold text-xs underline underline-offset-2 hover:text-yellow-200 transition disabled:opacity-50 whitespace-nowrap"
+          >
+            {refreshing ? "Opening…" : "Grant access"}
+          </button>
+        </div>
+      )}
+
+      {tokenExpired && !scopeMissing && (
         <div className="bg-yellow-950/40 border border-yellow-800/40 rounded-lg px-4 py-3 text-yellow-400 text-sm flex items-center justify-between gap-4">
           <span>Calendar access expired.</span>
           <button

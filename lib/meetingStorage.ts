@@ -1,3 +1,11 @@
+export type SummaryStatus =
+  | "not_started"
+  | "waiting_for_transcript"
+  | "generating"
+  | "completed"
+  | "failed"
+  | "needs_regeneration";
+
 export interface AgendaItem {
   id: string;
   text: string;
@@ -37,6 +45,41 @@ export interface RecordingResult {
   // GCS audio storage — absent on records saved before GCS was added
   chunkGcsPaths?: string[];  // ordered: recordings/{uid}/{meetingId}/chunk-{n}.webm
   audioGcsBucket?: string;
+  // Normalized transcript — absent on records saved before provider abstraction was added
+  normalizedTranscript?: import("./providers/types").NormalizedTranscript;
+}
+
+// ── Processing status ────────────────────────────────────────────────────────
+
+export type ProcessingStatus =
+  | "not_started"
+  | "queued"
+  | "transcribing"
+  | "transcribed"
+  | "transcription_failed"
+  | "summarizing"
+  | "completed"
+  | "summary_failed";
+
+export type ProcessingFailureCategory =
+  | "quota_exceeded"
+  | "rate_limited"
+  | "provider_unavailable"
+  | "invalid_audio"
+  | "file_too_large"
+  | "unsupported_format"
+  | "authentication_failed"
+  | "network_error"
+  | "configuration_error"
+  | "invalid_provider_response"
+  | "unknown";
+
+export interface ProcessingState {
+  status: ProcessingStatus;
+  failureCategory?: ProcessingFailureCategory;
+  userMessage?: string;
+  retriesUsed: number;
+  lastAttemptAt?: number;
 }
 
 export interface TimelineEvent {
@@ -59,7 +102,14 @@ export interface MeetingLocalData {
   openQuestions: string[];
   risks: string[];
   recording: RecordingResult | null;
+  /** Legacy flat-summary shape; kept for records saved before evidence-backed summaries */
   aiSummary: { execSummary: string; topics: string[]; actions: string[]; questions: string[]; risks: string[] } | null;
+  /** Evidence-backed summary from the new provider architecture */
+  evidenceSummary?: import("./providers/types").EvidenceBackedSummary;
+  /** Processing state for retry/failure tracking */
+  processingState?: ProcessingState;
+  /** User-confirmed speaker name mappings */
+  speakerMappings?: Array<{ providerLabel: string; confirmedName: string | null }>;
   timeline: TimelineEvent[];
   isPinned: boolean;
   tags: string[];
@@ -107,7 +157,7 @@ export function addTimelineEvent(
     ...data,
     timeline: [
       ...data.timeline,
-      { id: String(Date.now()), type, description, timestamp: Date.now() },
+      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, type, description, timestamp: Date.now() },
     ],
   };
 }

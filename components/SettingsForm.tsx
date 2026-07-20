@@ -1,13 +1,25 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { updateProfile } from "firebase/auth";
 import { auth } from "@/lib/firebase/client";
 
+const TRANSLATION_KEY = "mosaic_translation_enabled";
+
 export default function SettingsForm({ name: initialName, email }: { name: string; email: string }) {
-  const [name,   setName]   = useState(initialName);
-  const [saving, setSaving] = useState(false);
-  const [saved,  setSaved]  = useState(false);
-  const [error,  setError]  = useState("");
+  const [name,        setName]        = useState(initialName);
+  const [saving,      setSaving]      = useState(false);
+  const [saved,       setSaved]       = useState(false);
+  const [error,       setError]       = useState("");
+  const [translation, setTranslation] = useState(false);
+
+  useEffect(() => {
+    setTranslation(localStorage.getItem(TRANSLATION_KEY) === "true");
+  }, []);
+
+  const toggleTranslation = (enabled: boolean) => {
+    setTranslation(enabled);
+    localStorage.setItem(TRANSLATION_KEY, String(enabled));
+  };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -48,6 +60,37 @@ export default function SettingsForm({ name: initialName, email }: { name: strin
           {saving ? "Saving…" : saved ? "Saved!" : "Save changes"}
         </button>
       </form>
+
+      <div className="mt-8 pt-6 border-t border-gray-800">
+        <h3 className="text-sm font-semibold mb-1">Processing Preferences</h3>
+        <p className="text-xs text-gray-500 mb-4">Controls how recordings are processed. Changes apply to new recordings only.</p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">Translate to English</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              When off, transcription and summary use the original language. When on, audio is translated to English before summarisation.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={translation}
+            onClick={() => toggleTranslation(!translation)}
+            className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none ${
+              translation ? "bg-white" : "bg-gray-700"
+            }`}
+          >
+            <span
+              className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-black shadow transition-transform ${
+                translation ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </button>
+        </div>
+        <p className="text-xs text-gray-600 mt-3">
+          {translation ? "Translation on — audio will be translated to English." : "Translation off — summaries use original language text."}
+        </p>
+      </div>
     </section>
   );
 }

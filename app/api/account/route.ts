@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSession } from "@/lib/firebase/session";
 import { adminAuth, adminDb } from "@/lib/firebase/admin";
+import { getServerConfig } from "@/lib/config/server";
 
 export async function DELETE() {
   const user = await getSession();
@@ -27,7 +28,7 @@ export async function DELETE() {
 
   // Delete GCS recordings (best-effort — account deletion succeeds even if this fails)
   try {
-    const bucket = process.env.GCS_RECORDINGS_BUCKET;
+    const bucket = getServerConfig().keys.gcsBucket;
     if (bucket) {
       const { Storage } = await import('@google-cloud/storage');
       const [files] = await new Storage().bucket(bucket).getFiles({ prefix: `recordings/${user.uid}/` });

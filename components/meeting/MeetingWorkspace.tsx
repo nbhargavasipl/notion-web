@@ -8,18 +8,22 @@ import {
 import {
   MeetingLocalData, TimelineEvent,
   RecordingResult, DiarizationSegment, loadMeetingData, saveMeetingData,
-  addTimelineEvent, parseSummary,
+  addTimelineEvent,
 } from "@/lib/meetingStorage";
+import type {
+  NormalizedTranscript, EvidenceBackedSummary,
+  GroundedSummaryItem, GroundedActionItem, TranscriptSegment,
+} from "@/lib/providers/types";
+import type { PublicMosaicConfig } from "@/app/api/config/route";
 import { syncMeetingToFirestore, loadMeetingFromFirestore } from "@/lib/firestoreSync";
 import { auth } from "@/lib/firebase/client";
 
-// ── Recording types ────────────────────────────────────────────────────────────
-type RecordingMode    = "mic_and_meeting" | "mic_only";
-type AudioSourceStatus = "idle" | "connected" | "muted" | "not_shared" | "no_audio" | "disconnected" | "denied" | "error";
+// ── Types ──────────────────────────────────────────────────────────────────────
+type RecordingMode = "mic_and_meeting" | "mic_only";
+type WorkspaceTab = "summary" | "notes" | "transcript";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const MEETING_TYPES = ["General", "Standup", "Client Meeting", "Sprint Review", "Planning", "Retrospective", "1:1", "Interview", "Workshop", "Demo"];
-// 5-minute segments keep each webm blob well under the transcription service's 9 MB limit.
 const CHUNK_SECS = 5 * 60;
 
 const PLATFORM_COLORS: Record<string, string> = {
@@ -29,12 +33,21 @@ const PLATFORM_COLORS: Record<string, string> = {
   "Webex":           "#f59e0b",
 };
 
+const SPEAKER_COLORS = [
+  "text-blue-400", "text-green-400", "text-purple-400",
+  "text-yellow-400", "text-pink-400", "text-cyan-400",
+];
 
 function avatarInitials(email: string, name?: string) {
   if (name) return name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
   return email.slice(0, 2).toUpperCase();
 }
 function uid() { return Math.random().toString(36).slice(2, 9); }
+function fmtTime(secs: number) {
+  const m = Math.floor(secs / 60).toString().padStart(2, "0");
+  const s = Math.floor(secs % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
 
 // ── Main Component ─────────────────────────────────────────────────────────────
 export default function MeetingWorkspace({ eventId }: { eventId: string }) {
@@ -49,19 +62,23 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   const [elapsed,    setElapsed]    = useState(0);
   const [transcript, setTranscript] = useState<RecordingResult | null>(null);
   const [recError,   setRecError]   = useState<string | null>(null);
+  const [appConfig,  setAppConfig]  = useState<PublicMosaicConfig | null>(null);
 
-  const [addingMeetingAudio,     setAddingMeetingAudio]     = useState(false);
-  const [audioDevices,           setAudioDevices]           = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId,       setSelectedDeviceId]       = useState<string>("");
-  // Audio source tracking
-  const [recordingMode,          setRecordingMode]          = useState<RecordingMode>("mic_only");
-  const [micStatus,              setMicStatus]              = useState<AudioSourceStatus>("idle");
-  const [meetingAudioStatus,     setMeetingAudioStatus]     = useState<AudioSourceStatus>("not_shared");
-  const [micLevel,               setMicLevel]               = useState(0);
-  const [meetingLevel,           setMeetingLevel]           = useState(0);
-  const [recWarning,             setRecWarning]             = useState<string | null>(null);
-  const [chunkProgress,          setChunkProgress]          = useState<{ done: number; total: number } | null>(null);
+  const [audioDevices,     setAudioDevices]     = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
+  const [micLevel,         setMicLevel]         = useState(0);
+  const [recWarning,       setRecWarning]       = useState<string | null>(null);
+  const [chunkProgress,    setChunkProgress]    = useState<{ done: number; total: number } | null>(null);
+  const [debugAudioUrl,    setDebugAudioUrl]    = useState<string | null>(null);
 
+  // Tab + summary state
+  const [activeTab,         setActiveTab]         = useState<WorkspaceTab>("notes");
+  const [highlightSegmentId, setHighlightSegmentId] = useState<string | null>(null);
+  const [summaryLoading,    setSummaryLoading]    = useState(false);
+  const [summaryError,      setSummaryError]      = useState<string | null>(null);
+  const [hasUserEditedSummary, setHasUserEditedSummary] = useState(false);
+
+  // Refs — recording
   const mediaRef             = useRef<MediaRecorder | null>(null);
   const chunks               = useRef<Blob[]>([]);
   const streamRef            = useRef<MediaStream | null>(null);
@@ -70,22 +87,33 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   const audioDestRef         = useRef<MediaStreamAudioDestinationNode | null>(null);
   const timerRef             = useRef<ReturnType<typeof setInterval> | null>(null);
   const saveTimer            = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Extra refs for new audio routing + cleanup
   const micGainRef           = useRef<GainNode | null>(null);
-  const meetingGainRef       = useRef<GainNode | null>(null);
   const micAnalyserRef       = useRef<AnalyserNode | null>(null);
-  const meetingAnalyserRef   = useRef<AnalyserNode | null>(null);
   const levelTimerRef        = useRef<ReturnType<typeof setInterval> | null>(null);
   const trackCleanupFnsRef   = useRef<Array<() => void>>([]);
   const meetingEndedRef      = useRef(false);
   const isSettingUpRef       = useRef(false);
-  // Chunked-recording refs
+  const debugAudioUrlRef     = useRef<string | null>(null);
   const isFinalStopRef       = useRef(false);
   const chunkRotateTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
   const chunkResultsRef      = useRef<Map<number, { text: string; lang: string; conf: number | null; low: boolean }>>(new Map());
+  const chunkNormalizedRef   = useRef<Map<number, NormalizedTranscript>>(new Map());
   const pendingChunksRef     = useRef(0);
   const totalSegmentsRef     = useRef(0);
   const chunkGcsPathsRef     = useRef<Map<number, string>>(new Map());
+
+  // Refs — summary (prevent concurrent calls, avoid stale closures)
+  const summaryLoadingRef        = useRef(false);
+  const initialTabSetRef         = useRef(false);
+  const autoSummarizedTimestampRef = useRef<number | null>(null);
+
+  // ── Load public app config ──────────────────────────────────────────────────
+  useEffect(() => {
+    fetch("/api/config")
+      .then(r => r.json())
+      .then((cfg: PublicMosaicConfig) => setAppConfig(cfg))
+      .catch(() => {});
+  }, []);
 
   // ── Load event + data ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -99,22 +127,18 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       });
     }
 
-    // Seed UI from localStorage immediately to avoid blank flash during Firestore load
     const local = loadMeetingData(eventId);
     setData(local);
     if (local.recording) { setTranscript(local.recording); setRecStatus("done"); }
 
-    const uid = auth.currentUser?.uid;
-    if (!uid) { setLoading(false); return; }
+    const currentUid = auth.currentUser?.uid;
+    if (!currentUid) { setLoading(false); return; }
 
-    // Firestore is primary — setLoading(false) only after it resolves or fails
-    loadMeetingFromFirestore(uid, eventId).then(remote => {
+    loadMeetingFromFirestore(currentUid, eventId).then(remote => {
       if (!remote) {
-        // New meeting — push local seed to Firestore
-        syncMeetingToFirestore(uid, local).catch(() => {});
+        syncMeetingToFirestore(currentUid, local).catch(() => {});
         return;
       }
-      // Merge: Firestore wins on most fields; prefer whichever has more content
       const merged: MeetingLocalData = {
         ...local,
         ...remote,
@@ -123,13 +147,23 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         notes:       remote.notes.length >= local.notes.length ? remote.notes : local.notes,
         actionItems: remote.actionItems.length >= local.actionItems.length ? remote.actionItems : local.actionItems,
       };
-      saveMeetingData(merged); // update localStorage cache
+      saveMeetingData(merged);
       setData(merged);
       if (merged.recording) { setTranscript(merged.recording); setRecStatus("done"); }
-    }).catch(() => {
-      // Offline or error — localStorage seed already visible, just continue
-    }).finally(() => setLoading(false));
+    }).catch(() => {}).finally(() => setLoading(false));
   }, [eventId]);
+
+  // ── Initialize default tab once data loads ──────────────────────────────────
+  useEffect(() => {
+    if (!data || initialTabSetRef.current) return;
+    initialTabSetRef.current = true;
+    if (data.evidenceSummary || data.aiSummary) {
+      setActiveTab("summary");
+    } else if (data.recording) {
+      setActiveTab("transcript");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!!data]);
 
   // ── Cleanup on unmount ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -142,6 +176,7 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       displayRef.current?.getTracks().forEach(t => t.stop());
       streamRef.current?.getTracks().forEach(t => t.stop());
       if (audioCtxRef.current?.state !== "closed") audioCtxRef.current?.close().catch(() => {});
+      if (debugAudioUrlRef.current) { URL.revokeObjectURL(debugAudioUrlRef.current); debugAudioUrlRef.current = null; }
     };
   }, []);
 
@@ -153,9 +188,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       setSaved(false);
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
-        const uid = auth.currentUser?.uid;
-        if (uid) {
-          syncMeetingToFirestore(uid, next)
+        const currentUid = auth.currentUser?.uid;
+        if (currentUid) {
+          syncMeetingToFirestore(currentUid, next)
             .then(() => { saveMeetingData(next); setSaved(true); })
             .catch(() => { saveMeetingData(next); setSaved(true); });
         } else {
@@ -171,18 +206,115 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
     setData(prev => {
       if (!prev) return prev;
       const next = addTimelineEvent(prev, type, description);
-      const uid = auth.currentUser?.uid;
-      if (uid) syncMeetingToFirestore(uid, next).catch(() => {});
-      saveMeetingData(next); // local cache in parallel
+      const currentUid = auth.currentUser?.uid;
+      if (currentUid) syncMeetingToFirestore(currentUid, next).catch(() => {});
+      saveMeetingData(next);
       return next;
     });
   }, []);
 
-  // ── Recording ───────────────────────────────────────────────────────────────
+  // ── Summary generation ──────────────────────────────────────────────────────
+  const generateSummary = useCallback(async (result: RecordingResult, isRegeneration = false) => {
+    if (summaryLoadingRef.current) return;
 
-  // Tears down timers, level monitoring, and track event listeners.
-  // Does NOT stop tracks or close AudioContext — those must stay alive until
-  // MediaRecorder.onstop fires so the final audio chunk is not cut short.
+    if (isRegeneration && hasUserEditedSummary) {
+      const confirmed = window.confirm(
+        "Regenerating will replace your manual edits to the summary. Continue?"
+      );
+      if (!confirmed) return;
+      setHasUserEditedSummary(false);
+    }
+
+    summaryLoadingRef.current = true;
+    setSummaryLoading(true);
+    setSummaryError(null);
+
+    try {
+      const body = result.normalizedTranscript
+        ? { normalizedTranscript: result.normalizedTranscript, meetingTitle: data?.title, meetingId: eventId }
+        : { transcript: result.translated_transcript, segments: result.segments, meetingId: eventId };
+
+      const res = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json() as EvidenceBackedSummary & { error?: string; failureCategory?: string };
+
+      if (!res.ok) {
+        throw new Error(json.error ?? "AI processing is temporarily unavailable. Your recording has been preserved.");
+      }
+
+      if (json.provider) {
+        update({ evidenceSummary: json, aiSummary: null });
+        pushTimeline("summary_generated", "AI summary generated");
+        // Auto-switch to summary tab — but not while user is actively recording
+        setData(prev => {
+          if (prev?.recording && recStatus !== "recording" && recStatus !== "processing") {
+            setActiveTab("summary");
+          } else if (!prev?.recording) {
+            // No recording context check — just switch
+          }
+          return prev;
+        });
+        // Unconditional switch when not actively capturing
+        if (recStatus !== "recording" && recStatus !== "processing") {
+          setActiveTab("summary");
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "AI processing failed. Your recording has been preserved.";
+      setSummaryError(msg);
+    } finally {
+      setSummaryLoading(false);
+      summaryLoadingRef.current = false;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data?.title, eventId, hasUserEditedSummary, recStatus, update, pushTimeline]);
+
+  // Auto-trigger summary after transcript arrives — fires at most once per transcript timestamp
+  useEffect(() => {
+    if (
+      transcript &&
+      !data?.evidenceSummary &&
+      !data?.aiSummary &&
+      !summaryLoadingRef.current &&
+      autoSummarizedTimestampRef.current !== transcript.timestamp
+    ) {
+      autoSummarizedTimestampRef.current = transcript.timestamp;
+      generateSummary(transcript);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transcript?.timestamp]);
+
+  // ── Evidence click: navigate to transcript + scroll + highlight ─────────────
+  const handleEvidenceClick = useCallback((segmentId: string) => {
+    setHighlightSegmentId(segmentId);
+    setActiveTab("transcript");
+  }, []);
+
+  const handleHighlightClear = useCallback(() => {
+    setHighlightSegmentId(null);
+  }, []);
+
+  // ── Update action item in evidence summary ──────────────────────────────────
+  const handleUpdateActionItem = useCallback((itemId: string, changes: Partial<GroundedActionItem>) => {
+    setData(prev => {
+      if (!prev?.evidenceSummary) return prev;
+      const updatedItems = prev.evidenceSummary.actionItems.map(item =>
+        item.id === itemId ? { ...item, ...changes } : item
+      );
+      const next = {
+        ...prev,
+        evidenceSummary: { ...prev.evidenceSummary, actionItems: updatedItems },
+      };
+      saveMeetingData(next);
+      return next;
+    });
+    setHasUserEditedSummary(true);
+  }, []);
+
+  // ── Recording ───────────────────────────────────────────────────────────────
   const cleanupMonitoring = useCallback(() => {
     if (levelTimerRef.current)       { clearInterval(levelTimerRef.current);       levelTimerRef.current       = null; }
     if (timerRef.current)            { clearInterval(timerRef.current);            timerRef.current            = null; }
@@ -190,10 +322,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
     trackCleanupFnsRef.current.forEach(fn => fn());
     trackCleanupFnsRef.current = [];
     setMicLevel(0);
-    setMeetingLevel(0);
   }, []);
 
-  const startRecording = async (withMeetingAudio = false) => {
+  const startRecording = async () => {
     if (isSettingUpRef.current || recStatus === "processing") return;
     isSettingUpRef.current = true;
 
@@ -202,43 +333,60 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
     isFinalStopRef.current = false;
     chunks.current = [];
     chunkResultsRef.current = new Map();
+    chunkNormalizedRef.current = new Map();
     chunkGcsPathsRef.current = new Map();
     pendingChunksRef.current = 0;
     totalSegmentsRef.current = 0;
     setChunkProgress(null);
     setRecError(null);
     setRecWarning(null);
-    setMicStatus("idle");
-    setMeetingAudioStatus(withMeetingAudio ? "idle" : "not_shared");
+    if (debugAudioUrlRef.current) { URL.revokeObjectURL(debugAudioUrlRef.current); debugAudioUrlRef.current = null; setDebugAudioUrl(null); }
+
+    // Room-recording microphone constraints — voice isolation intentionally OFF
+    // so remote voices playing through speakers are captured acoustically.
+    const supported = navigator.mediaDevices.getSupportedConstraints();
+    const roomAudioConstraints: MediaTrackConstraints = {};
+    if (supported.echoCancellation) roomAudioConstraints.echoCancellation = false;
+    if (supported.noiseSuppression) roomAudioConstraints.noiseSuppression = false;
+    if (supported.autoGainControl)  roomAudioConstraints.autoGainControl  = false;
+    if (supported.channelCount)     roomAudioConstraints.channelCount     = 1;
+    if (selectedDeviceId && supported.deviceId) roomAudioConstraints.deviceId = { exact: selectedDeviceId };
+    const micConstraints: MediaStreamConstraints = { audio: roomAudioConstraints };
+
+    const micPromise = navigator.mediaDevices.getUserMedia(micConstraints);
 
     let ctx: AudioContext | null = null;
-    let mode: RecordingMode = "mic_only";
+    const mode: RecordingMode = "mic_only";
 
     try {
       ctx = new AudioContext();
       audioCtxRef.current = ctx;
-      // Chrome may suspend AudioContext even inside a click handler
       if (ctx.state === "suspended") await ctx.resume();
 
       const dest = ctx.createMediaStreamDestination();
       audioDestRef.current = dest;
 
-      // ── Microphone ──────────────────────────────────────────────────────────
-      const micConstraints: MediaStreamConstraints = selectedDeviceId
-        ? { audio: { deviceId: { exact: selectedDeviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }
-        : { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
-
       let micStream: MediaStream;
       try {
-        micStream = await navigator.mediaDevices.getUserMedia(micConstraints);
+        micStream = await micPromise;
       } catch (err: unknown) {
-        setMicStatus("denied");
         const e = err instanceof Error ? err : new Error(String(err));
         throw new Error((e as { name?: string }).name === "NotAllowedError" ? "Microphone access denied." : (e.message ?? "Could not access microphone."));
       }
 
       streamRef.current = micStream;
-      setMicStatus("connected");
+
+      if (process.env.NODE_ENV === "development") {
+        const track = micStream.getAudioTracks()[0];
+        if (track) {
+          const settings = track.getSettings();
+          console.log("[MOSAIC][dev] Mic track settings:", {
+            requested: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+            actual: { echoCancellation: settings.echoCancellation, noiseSuppression: settings.noiseSuppression, autoGainControl: settings.autoGainControl, sampleRate: settings.sampleRate, channelCount: settings.channelCount },
+            deviceId: settings.deviceId, label: track.label, enabled: track.enabled, muted: track.muted, readyState: track.readyState,
+          });
+        }
+      }
 
       if (audioDevices.length === 0) {
         navigator.mediaDevices.enumerateDevices().then(devs =>
@@ -246,7 +394,6 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         );
       }
 
-      // mic → gain → analyser → destination
       const micSource   = ctx.createMediaStreamSource(micStream);
       const micGain     = ctx.createGain();
       micGain.gain.value = 1.0;
@@ -258,104 +405,22 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       micGain.connect(micAnalyser);
       micAnalyser.connect(dest);
 
-      // Track lifecycle — mic
       const micTrack = micStream.getAudioTracks()[0];
       if (micTrack) {
-        const onMicEnded   = () => { setMicStatus("disconnected"); pushTimeline("recording_started", "Microphone disconnected during recording"); };
-        const onMicMuted   = () => setMicStatus("muted");
-        const onMicUnmuted = () => setMicStatus("connected");
-        micTrack.addEventListener("ended",  onMicEnded);
-        micTrack.addEventListener("mute",   onMicMuted);
-        micTrack.addEventListener("unmute", onMicUnmuted);
-        trackCleanupFnsRef.current.push(() => {
-          micTrack.removeEventListener("ended",  onMicEnded);
-          micTrack.removeEventListener("mute",   onMicMuted);
-          micTrack.removeEventListener("unmute", onMicUnmuted);
-        });
+        const onMicEnded = () => {
+          setRecWarning("Microphone disconnected. Please check your microphone connection.");
+          pushTimeline("recording_started", "Microphone disconnected during recording");
+        };
+        micTrack.addEventListener("ended", onMicEnded);
+        trackCleanupFnsRef.current.push(() => micTrack.removeEventListener("ended", onMicEnded));
       }
 
-      // ── Meeting audio via getDisplayMedia ────────────────────────────────────
-      if (withMeetingAudio) {
-        try {
-          // systemAudio:"include" enables broader capture on supported OS/browser combos.
-          // selfBrowserSurface:"exclude" prevents the MOSAIC tab from appearing in the picker.
-          const displayStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
-            audio: true,
-            systemAudio: "include",
-            selfBrowserSurface: "exclude",
-          } as DisplayMediaStreamOptions);
-          displayRef.current = displayStream;
+      // Quick Recording: mic only — no getDisplayMedia, no screen picker.
 
-          const liveAudioTrack = displayStream.getAudioTracks().find(t => t.readyState === "live");
-
-          if (liveAudioTrack) {
-            // meeting audio → gain → analyser → destination
-            const meetingSource   = ctx.createMediaStreamSource(displayStream);
-            const meetingGain     = ctx.createGain();
-            meetingGain.gain.value = 1.0;
-            meetingGainRef.current = meetingGain;
-            const meetingAnalyser = ctx.createAnalyser();
-            meetingAnalyser.fftSize = 256;
-            meetingAnalyserRef.current = meetingAnalyser;
-            meetingSource.connect(meetingGain);
-            meetingGain.connect(meetingAnalyser);
-            meetingAnalyser.connect(dest);
-
-            mode = "mic_and_meeting";
-            setMeetingAudioStatus("connected");
-
-            // Track lifecycle — meeting audio
-            const onMeetingEnded = () => {
-              meetingEndedRef.current = true;
-              setMeetingAudioStatus("disconnected");
-              setRecordingMode("mic_only");
-              setRecWarning("Meeting audio disconnected — continuing with microphone only.");
-              pushTimeline("recording_started", "Meeting audio disconnected — continuing with microphone");
-            };
-            const onMeetingMuted   = () => setMeetingAudioStatus("muted");
-            const onMeetingUnmuted = () => setMeetingAudioStatus("connected");
-            liveAudioTrack.addEventListener("ended",  onMeetingEnded);
-            liveAudioTrack.addEventListener("mute",   onMeetingMuted);
-            liveAudioTrack.addEventListener("unmute", onMeetingUnmuted);
-            trackCleanupFnsRef.current.push(() => {
-              liveAudioTrack.removeEventListener("ended",  onMeetingEnded);
-              liveAudioTrack.removeEventListener("mute",   onMeetingMuted);
-              liveAudioTrack.removeEventListener("unmute", onMeetingUnmuted);
-            });
-          } else {
-            // Screen/window shared but browser gave no audio track.
-            // The display video track is NOT stopped here — stopping it in Chrome
-            // can terminate the entire capture session including any audio.
-            setMeetingAudioStatus("no_audio");
-            const videoLabel = displayStream.getVideoTracks()[0]?.label ?? "";
-            const isNativeApp = /window|screen/i.test(videoLabel) && !/tab/i.test(videoLabel);
-            setRecWarning(
-              isNativeApp
-                ? "No audio from this window or screen. Native desktop app audio is not available in the browser. Recording microphone only. Full audio capture will be supported in the MOSAIC desktop app."
-                : 'No meeting audio — make sure to enable "Share tab audio" when selecting your meeting tab in the sharing dialog.'
-            );
-          }
-        } catch (err: unknown) {
-          const name = err instanceof Error ? (err as { name?: string }).name : "";
-          const cancelled = name === "NotAllowedError" || name === "AbortError";
-          setMeetingAudioStatus(cancelled ? "not_shared" : "error");
-          if (!cancelled) {
-            setRecWarning("Could not access screen audio. Recording with microphone only.");
-          }
-          // Either way, continue with mic-only
-        }
-      }
-
-      setRecordingMode(mode);
-
-      // ── MediaRecorder — chunked to stay under the 9 MB transcription limit ──
       const mimeTypes = ["audio/webm;codecs=opus", "audio/webm", "video/webm;codecs=opus", "video/webm"];
       const mime = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) ?? "";
       const blobType = mime || "audio/webm";
 
-      // Upload one chunk blob directly to GCS via a server-issued signed URL.
-      // Runs in parallel with transcription — failure is non-fatal.
       const uploadChunkToGcs = async (blob: Blob, chunkIndex: number) => {
         try {
           const res = await fetch("/api/recordings/signed-url", {
@@ -372,7 +437,6 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         }
       };
 
-      // Build the final RecordingResult from all collected chunk transcripts.
       const finalizeCombined = () => {
         const indices = Array.from(chunkResultsRef.current.keys()).sort((a, b) => a - b);
         if (indices.length === 0) {
@@ -387,6 +451,27 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         const anyLow   = indices.some(i => chunkResultsRef.current.get(i)!.low);
         const gcsPaths = indices.map(i => chunkGcsPathsRef.current.get(i)).filter((p): p is string => p !== undefined);
 
+        const chunkNTs = indices.map(i => chunkNormalizedRef.current.get(i)).filter((n): n is NormalizedTranscript => !!n);
+        let mergedNormalized: NormalizedTranscript | undefined;
+        if (chunkNTs.length > 0) {
+          let segCounter = 0;
+          const allSegments = chunkNTs.flatMap(nt => nt.segments.map(seg => ({
+            ...seg,
+            segmentId: `S${String(++segCounter).padStart(3, "0")}`,
+          })));
+          mergedNormalized = {
+            ...chunkNTs[0],
+            fullText: chunkNTs.map(nt => nt.fullText).join(" "),
+            originalFullText: chunkNTs.map(nt => nt.originalFullText).join(" "),
+            segments: allSegments,
+            durationSeconds: chunkNTs.reduce((s, nt) => s + (nt.durationSeconds ?? 0), 0) || null,
+            processingMetadata: {
+              ...chunkNTs[0].processingMetadata,
+              completedAt: chunkNTs[chunkNTs.length - 1].processingMetadata.completedAt,
+            },
+          };
+        }
+
         const result: RecordingResult = {
           translated_transcript: combined,
           input_language: first.lang,
@@ -395,11 +480,12 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
           timestamp: Date.now(),
           recordingMode: mode,
           microphoneCaptured: true,
-          meetingAudioCaptured: mode === "mic_and_meeting",
+          meetingAudioCaptured: false,
           meetingAudioEndedDuringRecording: meetingEndedRef.current,
           mimeType: blobType,
           chunkGcsPaths: gcsPaths.length > 0 ? gcsPaths : undefined,
           audioGcsBucket: gcsPaths.length > 0 ? (process.env.NEXT_PUBLIC_GCS_RECORDINGS_BUCKET || undefined) : undefined,
+          normalizedTranscript: mergedNormalized,
         };
         setTranscript(result);
         setRecStatus("done");
@@ -407,9 +493,9 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         setData(prev => {
           if (!prev) return prev;
           const next = addTimelineEvent({ ...prev, recording: result }, "recording_done", "Recording completed and transcribed");
-          const uid = auth.currentUser?.uid;
-          if (uid) {
-            syncMeetingToFirestore(uid, next)
+          const currentUid = auth.currentUser?.uid;
+          if (currentUid) {
+            syncMeetingToFirestore(currentUid, next)
               .then(() => saveMeetingData(next))
               .catch(() => saveMeetingData(next));
           } else {
@@ -419,15 +505,21 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         });
       };
 
-      // Transcribe one chunk. GCS upload runs in parallel (fire-and-forget).
       const transcribeChunk = async (blob: Blob, chunkIndex: number) => {
         pendingChunksRef.current++;
-        uploadChunkToGcs(blob, chunkIndex); // parallel, non-blocking
+        uploadChunkToGcs(blob, chunkIndex);
+        const translationEnabled = localStorage.getItem("mosaic_translation_enabled") === "true";
         try {
           const form = new FormData();
           form.append("file", new File([blob], `chunk-${chunkIndex}.webm`, { type: blobType }));
+          if (!translationEnabled) form.append("skipTranslation", "true");
           const res  = await fetch("/api/transcribe", { method: "POST", body: form });
-          const json = await res.json();
+          const json = await res.json() as {
+            success?: boolean; translated_transcript?: string; input_language?: string;
+            confidence?: number | null; low_confidence?: boolean;
+            normalizedTranscript?: NormalizedTranscript;
+            error?: string; message?: string;
+          };
           if (json.success !== false) {
             chunkResultsRef.current.set(chunkIndex, {
               text: json.translated_transcript ?? "",
@@ -435,9 +527,10 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
               conf: json.confidence ?? null,
               low:  !!json.low_confidence,
             });
+            if (json.normalizedTranscript) chunkNormalizedRef.current.set(chunkIndex, json.normalizedTranscript);
           } else {
             chunkResultsRef.current.set(chunkIndex, {
-              text: `[Part ${chunkIndex + 1} failed: ${json.message || json.error || "unknown error"}]`,
+              text: `[Part ${chunkIndex + 1} could not be transcribed]`,
               lang: "Unknown", conf: null, low: false,
             });
           }
@@ -453,8 +546,6 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
         }
       };
 
-      // Start a new MediaRecorder segment. On rotation, the next segment starts
-      // before transcribing the current one so no audio is lost.
       const startSegment = (chunkIndex: number) => {
         chunks.current = [];
         totalSegmentsRef.current++;
@@ -466,8 +557,6 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
           const isFinal = isFinalStopRef.current;
 
           if (isFinal) {
-            // Close audio infrastructure only after the final segment flushes.
-            // Stopping video tracks early kills Chrome's display-capture audio session.
             displayRef.current?.getTracks().forEach(t => t.stop());
             streamRef.current?.getTracks().forEach(t => t.stop());
             displayRef.current = null;
@@ -480,6 +569,12 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
           }
 
           if (blob.size > 0) {
+            if (isFinal && process.env.NODE_ENV === "development") {
+              const devUrl = URL.createObjectURL(blob);
+              debugAudioUrlRef.current = devUrl;
+              setDebugAudioUrl(devUrl);
+              console.log("[MOSAIC][dev] Raw recording ready:", devUrl, `(${blob.size} bytes)`);
+            }
             transcribeChunk(blob, chunkIndex);
           } else if (isFinal && pendingChunksRef.current === 0) {
             finalizeCombined();
@@ -490,22 +585,15 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
 
       startSegment(0);
 
-      // Rotate the recorder every CHUNK_SECS to keep blobs under the 9 MB API limit.
       chunkRotateTimerRef.current = setInterval(() => {
         if (mediaRef.current?.state === "recording") mediaRef.current.stop();
       }, CHUNK_SECS * 1000);
 
-      // Live level monitoring (~10 fps — avoids 60-fps re-render flood)
       levelTimerRef.current = setInterval(() => {
         if (micAnalyserRef.current) {
           const buf = new Uint8Array(micAnalyserRef.current.frequencyBinCount);
           micAnalyserRef.current.getByteFrequencyData(buf);
           setMicLevel(buf.reduce((a, b) => a + b, 0) / (buf.length * 255));
-        }
-        if (meetingAnalyserRef.current) {
-          const buf = new Uint8Array(meetingAnalyserRef.current.frequencyBinCount);
-          meetingAnalyserRef.current.getByteFrequencyData(buf);
-          setMeetingLevel(buf.reduce((a, b) => a + b, 0) / (buf.length * 255));
         }
       }, 100);
 
@@ -513,9 +601,7 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
       timerRef.current = setInterval(() => { secs++; setElapsed(secs); }, 1000);
       setElapsed(0);
       setRecStatus("recording");
-      pushTimeline("recording_started", mode === "mic_and_meeting"
-        ? "Recording started (mic + meeting audio)"
-        : "Recording started (microphone only)");
+      pushTimeline("recording_started", "Recording started (microphone)");
 
     } catch (err: unknown) {
       cleanupMonitoring();
@@ -534,89 +620,23 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   };
 
   const stopRecording = () => {
-    cleanupMonitoring(); // stops timers + rotation timer
+    cleanupMonitoring();
     isFinalStopRef.current = true;
-    mediaRef.current?.stop(); // onstop handles tracks, AudioContext, and transcription
+    mediaRef.current?.stop();
     setRecStatus("processing");
-  };
-
-  const addMeetingAudio = async () => {
-    if (!audioCtxRef.current || !audioDestRef.current) return;
-    setAddingMeetingAudio(true);
-    try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-        systemAudio: "include",
-        selfBrowserSurface: "exclude",
-      } as DisplayMediaStreamOptions);
-
-      const liveTrack = displayStream.getAudioTracks().find(t => t.readyState === "live");
-
-      if (liveTrack) {
-        // Replace old display stream if one already exists
-        displayRef.current?.getTracks().forEach(t => t.stop());
-        displayRef.current = displayStream;
-
-        const ctx  = audioCtxRef.current;
-        const dest = audioDestRef.current;
-
-        const meetingSource   = ctx.createMediaStreamSource(displayStream);
-        const meetingGain     = ctx.createGain();
-        meetingGain.gain.value = 1.0;
-        meetingGainRef.current = meetingGain;
-        const meetingAnalyser = ctx.createAnalyser();
-        meetingAnalyser.fftSize = 256;
-        meetingAnalyserRef.current = meetingAnalyser;
-        meetingSource.connect(meetingGain);
-        meetingGain.connect(meetingAnalyser);
-        meetingAnalyser.connect(dest);
-
-        setMeetingAudioStatus("connected");
-        setRecordingMode("mic_and_meeting");
-        setRecWarning(null);
-
-        const onMeetingEnded = () => {
-          meetingEndedRef.current = true;
-          setMeetingAudioStatus("disconnected");
-          setRecordingMode("mic_only");
-          setRecWarning("Meeting audio disconnected — continuing with microphone only.");
-          pushTimeline("recording_started", "Meeting audio disconnected — continuing with microphone");
-        };
-        const onMeetingMuted   = () => setMeetingAudioStatus("muted");
-        const onMeetingUnmuted = () => setMeetingAudioStatus("connected");
-        liveTrack.addEventListener("ended",  onMeetingEnded);
-        liveTrack.addEventListener("mute",   onMeetingMuted);
-        liveTrack.addEventListener("unmute", onMeetingUnmuted);
-        trackCleanupFnsRef.current.push(() => {
-          liveTrack.removeEventListener("ended",  onMeetingEnded);
-          liveTrack.removeEventListener("mute",   onMeetingMuted);
-          liveTrack.removeEventListener("unmute", onMeetingUnmuted);
-        });
-
-        pushTimeline("recording_started", "Meeting audio added to recording");
-      } else {
-        displayStream.getTracks().forEach(t => t.stop());
-        setMeetingAudioStatus("no_audio");
-        setRecWarning('No meeting audio — in the sharing dialog, select your meeting tab and enable "Share tab audio".');
-      }
-    } catch {
-      // User cancelled the dialog — keep current mode
-    } finally {
-      setAddingMeetingAudio(false);
-    }
   };
 
   const fmt = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
+  // ── Loading skeleton ─────────────────────────────────────────────────────────
   if (loading || !data) {
     return (
       <div className="min-h-screen bg-black text-white">
         <div className="border-b border-gray-800 bg-black sticky top-0 z-10 h-16" />
-        <div className="max-w-2xl mx-auto px-6 py-8 flex flex-col gap-8 animate-pulse">
+        <div className="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-8 animate-pulse">
           <div className="h-5 bg-gray-800 rounded w-40" />
           <div className="h-32 bg-gray-900 border border-gray-800 rounded-xl" />
-          <div className="h-48 bg-gray-900 border border-gray-800 rounded-xl" />
+          <div className="h-8 bg-gray-900 border border-gray-800 rounded" />
           <div className="h-64 bg-gray-900 border border-gray-800 rounded-xl" />
         </div>
       </div>
@@ -636,10 +656,20 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
   return (
     <div className="min-h-screen bg-black text-white">
 
+      {/* Demo mode banner */}
+      {appConfig?.appMode === "demo" && (
+        <div className="bg-gray-900 border-b border-gray-800 px-4 py-1.5 text-center">
+          <span className="text-[11px] text-gray-500">
+            Demo Mode · Free processing limits apply ·{" "}
+            {appConfig.capabilities.speakerDiarization ? "Speaker separation available" : "Single-speaker transcription"}
+          </span>
+        </div>
+      )}
+
       {/* ── Header ── */}
       <div className="border-b border-gray-800 bg-black sticky top-0 z-10">
-        <div className="max-w-5xl mx-auto px-6 py-4">
-          <div className="flex items-start justify-between gap-4">
+        <div className="max-w-5xl mx-auto px-6 pt-4 pb-0">
+          <div className="flex items-start justify-between gap-4 pb-3">
             <div className="flex items-start gap-4 min-w-0">
               <button
                 onClick={() => router.push("/meetings")}
@@ -692,15 +722,11 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
             </div>
 
             <div className="flex items-center gap-2 flex-shrink-0">
-              {/* Attendees */}
               {attendees.length > 0 && (
                 <div className="flex items-center mr-2">
                   {attendees.slice(0, 4).map((a, i) => (
-                    <div
-                      key={i}
-                      title={a.displayName ?? a.email}
-                      className="w-7 h-7 rounded-full bg-gray-700 border-2 border-black flex items-center justify-center text-[10px] font-bold text-gray-300 -ml-1.5 first:ml-0"
-                    >
+                    <div key={i} title={a.displayName ?? a.email}
+                      className="w-7 h-7 rounded-full bg-gray-700 border-2 border-black flex items-center justify-center text-[10px] font-bold text-gray-300 -ml-1.5 first:ml-0">
                       {avatarInitials(a.email, a.displayName)}
                     </div>
                   ))}
@@ -711,52 +737,30 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
                   )}
                 </div>
               )}
-
-              {/* Pin */}
               <button
                 onClick={() => update({ isPinned: !data.isPinned })}
                 title={data.isPinned ? "Unpin" : "Pin"}
                 className={`text-lg transition ${data.isPinned ? "text-yellow-400" : "text-gray-700 hover:text-gray-400"}`}
-              >
-                ★
-              </button>
-
-              {/* Save indicator */}
+              >★</button>
               <span className="text-xs text-gray-700 ml-1">{saved ? "Saved" : "Saving…"}</span>
-
-              {/* Join link */}
               {event?.hangoutLink && (
-                <a
-                  href={event.hangoutLink}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg font-medium transition"
-                >
+                <a href={event.hangoutLink} target="_blank" rel="noopener noreferrer"
+                  className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg font-medium transition">
                   Join Meeting
                 </a>
               )}
-
-              {/* Quick record */}
+              {/* Quick record — unchanged */}
               {recStatus === "idle" && (
-                <button
-                  onClick={() => startRecording(true)}
-                  className="text-xs bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded-lg font-medium transition"
-                >
+                <button onClick={() => startRecording()}
+                  className="text-xs bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded-lg font-medium transition">
                   ⏺ Record
                 </button>
               )}
               {recStatus === "recording" && (
-                <>
-                  <span className={`text-[10px] px-2 py-0.5 rounded-full ${recordingMode === "mic_and_meeting" ? "bg-green-500/20 text-green-400" : "bg-yellow-500/20 text-yellow-400"}`}>
-                    {recordingMode === "mic_and_meeting" ? "Mic + Meeting Audio" : "Mic Only"}
-                  </span>
-                  <button
-                    onClick={stopRecording}
-                    className="text-xs border border-red-500 text-red-400 px-3 py-1.5 rounded-lg font-medium hover:bg-red-950 transition"
-                  >
-                    ⏹ {fmt(elapsed)}
-                  </button>
-                </>
+                <button onClick={stopRecording}
+                  className="text-xs border border-red-500 text-red-400 px-3 py-1.5 rounded-lg font-medium hover:bg-red-950 transition">
+                  ⏹ {fmt(elapsed)}
+                </button>
               )}
               {recStatus === "processing" && (
                 <span className="text-xs text-yellow-400">
@@ -767,130 +771,93 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
               )}
             </div>
           </div>
-        </div>
 
+          {/* ── Tab bar (part of sticky header) ── */}
+          <div className="flex border-t border-gray-800 -mx-6 px-6">
+            {(["summary", "notes", "transcript"] as const).map(tab => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-5 py-3 text-sm font-medium transition border-b-2 -mb-px ${
+                  activeTab === tab
+                    ? "text-white border-white"
+                    : "text-gray-500 hover:text-gray-300 border-transparent"
+                }`}
+              >
+                {tab === "summary" ? "Summary" : tab === "notes" ? "Notes" : "Transcript"}
+              </button>
+            ))}
+            {summaryLoading && (
+              <span className="ml-auto flex items-center pr-1 text-[11px] text-gray-600 animate-pulse">
+                Generating summary…
+              </span>
+            )}
+          </div>
+        </div>
       </div>
 
-      {/* ── Content ── */}
-      <div className="max-w-2xl mx-auto px-6 py-8 flex flex-col gap-10">
+      {/* ── Body ── */}
+      <div className="max-w-4xl mx-auto px-6 py-6 flex flex-col gap-6">
 
-        {/* Recording */}
+        {/* Recording card — always at top, above tabs */}
         <div>
           <p className="text-xs font-semibold text-gray-600 uppercase tracking-wider mb-3">Recording</p>
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
             {recStatus === "idle" && (
               <div className="flex flex-col gap-3">
-                {/* Option 1: Browser-tab meeting */}
                 <button
-                  onClick={() => startRecording(true)}
+                  onClick={() => startRecording()}
                   className="w-full flex items-center justify-between bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-600 rounded-xl px-5 py-4 transition text-left group"
                 >
                   <div>
-                    <p className="text-sm font-semibold text-white mb-0.5">⏺ Mic + Meeting audio <span className="text-xs font-normal text-blue-400 ml-1">Recommended</span></p>
-                    <p className="text-xs text-gray-500">For Google Meet, Teams, or Zoom in browser — share the tab to capture all participants.</p>
+                    <p className="text-sm font-semibold text-white mb-0.5">⏺ Start Recording</p>
+                    <p className="text-xs text-gray-500">Records room audio through your microphone. Transcribes and summarizes with AI.</p>
                   </div>
                   <span className="text-gray-600 group-hover:text-gray-400 ml-4 flex-shrink-0 text-lg">→</span>
                 </button>
-
-                {/* Option 2: Mic only */}
-                <button
-                  onClick={() => startRecording(false)}
-                  className="w-full flex items-center justify-between border border-gray-800 hover:border-gray-700 rounded-xl px-5 py-3 transition text-left"
-                >
-                  <div>
-                    <p className="text-sm font-medium text-gray-400 mb-0.5">Microphone only</p>
-                    <p className="text-xs text-gray-600">When call audio plays through speakers so the mic picks it up.</p>
-                  </div>
-                </button>
-
-                {/* Zoom desktop app tip */}
-                <div className="bg-blue-950/30 border border-blue-900/30 rounded-xl px-4 py-3">
-                  <p className="text-xs text-blue-400 font-medium mb-1">Using Zoom / Teams desktop app?</p>
-                  <p className="text-xs text-gray-500">
-                    Browser cannot capture audio from desktop apps directly.{" "}
-                    <strong className="text-gray-400">Best options:</strong>{" "}
-                    join via browser (zoom.us in Chrome), put Zoom on speakers so mic picks it up,
-                    or use a virtual audio device like BlackHole (macOS) and select it below.
-                  </p>
-                  {/* Audio device selector — useful for BlackHole / Loopback users */}
-                  {audioDevices.length > 1 && (
+                <p className="text-xs text-gray-700 px-1">
+                  For virtual meetings, use your computer speakers and disconnect headphones so all participants can be heard.
+                </p>
+                {audioDevices.length > 1 && (
+                  <div className="px-1">
+                    <label className="text-xs text-gray-500 mb-1 block">Microphone</label>
                     <select
                       value={selectedDeviceId}
                       onChange={e => setSelectedDeviceId(e.target.value)}
-                      className="mt-2 w-full bg-gray-900 border border-gray-700 text-xs text-gray-300 rounded-lg px-3 py-1.5 outline-none"
+                      className="w-full bg-gray-900 border border-gray-700 text-xs text-gray-300 rounded-lg px-3 py-1.5 outline-none"
                     >
                       <option value="">Default microphone</option>
                       {audioDevices.map(d => (
                         <option key={d.deviceId} value={d.deviceId}>{d.label || `Microphone ${d.deviceId.slice(0, 6)}`}</option>
                       ))}
                     </select>
-                  )}
-                  {audioDevices.length <= 1 && (
-                    <button
-                      onClick={async () => {
-                        // Request permission first so labels appear
-                        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-                        s.getTracks().forEach(t => t.stop());
-                        const devs = await navigator.mediaDevices.enumerateDevices();
-                        setAudioDevices(devs.filter(d => d.kind === "audioinput"));
-                      }}
-                      className="mt-2 text-xs text-blue-500 hover:text-blue-400 underline"
-                    >
-                      Show audio devices
-                    </button>
-                  )}
-                </div>
+                  </div>
+                )}
               </div>
             )}
             {recStatus === "recording" && (
               <div className="flex flex-col gap-3">
-                {/* Timer + mode badge + stop button */}
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <div className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
                     <span className="text-xl font-mono font-bold text-red-400">{fmt(elapsed)}</span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full border ${
-                      recordingMode === "mic_and_meeting"
-                        ? "bg-green-500/10 border-green-500/30 text-green-400"
-                        : "bg-yellow-500/10 border-yellow-500/30 text-yellow-400"
-                    }`}>
-                      {recordingMode === "mic_and_meeting" ? "Mic + Meeting Audio" : "Microphone Only"}
-                    </span>
+                    <div className="flex items-end gap-px h-3" aria-label="Microphone level">
+                      {[0.15, 0.35, 0.55, 0.75].map((threshold, i) => (
+                        <div key={i}
+                          className={`w-1 rounded-sm transition-all duration-100 ${micLevel > threshold ? "bg-green-400" : "bg-gray-700"}`}
+                          style={{ height: `${(i + 1) * 25}%` }} />
+                      ))}
+                    </div>
+                    <span className="text-xs text-gray-500">Recording</span>
                   </div>
-                  <button
-                    onClick={stopRecording}
-                    className="border border-red-500 text-red-400 hover:bg-red-950 text-sm font-semibold px-4 py-2 rounded-lg transition"
-                  >
+                  <button onClick={stopRecording}
+                    className="border border-red-500 text-red-400 hover:bg-red-950 text-sm font-semibold px-4 py-2 rounded-lg transition">
                     ⏹ Stop
                   </button>
                 </div>
-
-                {/* Live audio source status */}
-                <AudioSourcePanel
-                  micStatus={micStatus}
-                  meetingAudioStatus={meetingAudioStatus}
-                  micLevel={micLevel}
-                  meetingLevel={meetingLevel}
-                />
-
-                {/* Warning banner (missing/dropped meeting audio) */}
                 {recWarning && (
                   <div className="bg-yellow-950/20 border border-yellow-900/30 rounded-lg px-4 py-2.5 text-xs text-yellow-400">
                     {recWarning}
-                  </div>
-                )}
-
-                {/* Add meeting audio mid-recording */}
-                {recordingMode === "mic_only" && !recWarning?.includes("desktop") && (
-                  <div className="flex items-center justify-between bg-gray-800/50 border border-gray-700/50 rounded-lg px-4 py-2.5">
-                    <p className="text-xs text-gray-500">Add your meeting tab to also capture remote participants.</p>
-                    <button
-                      onClick={addMeetingAudio}
-                      disabled={addingMeetingAudio}
-                      className="text-xs bg-yellow-600 hover:bg-yellow-500 disabled:opacity-50 text-white font-medium px-3 py-1.5 rounded-md transition ml-3 flex-shrink-0"
-                    >
-                      {addingMeetingAudio ? "Opening…" : "+ Add meeting audio"}
-                    </button>
                   </div>
                 )}
               </div>
@@ -904,23 +871,29 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
               </div>
             )}
             {recStatus === "done" && transcript && (
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-sm text-green-400">
-                  <span>✓</span>
-                  <span>
-                    {transcript.input_language} detected
-                    {transcript.confidence !== null && ` · ${Math.round(transcript.confidence * 100)}% confidence`}
-                  </span>
-                  {transcript.low_confidence && (
-                    <span className="text-xs text-yellow-500 ml-1">(low confidence)</span>
-                  )}
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-sm text-green-400">
+                    <span>✓</span>
+                    <span>
+                      {transcript.input_language} detected
+                      {transcript.confidence !== null && ` · ${Math.round(transcript.confidence * 100)}% confidence`}
+                    </span>
+                    {transcript.low_confidence && (
+                      <span className="text-xs text-yellow-500 ml-1">(low confidence)</span>
+                    )}
+                  </div>
+                  <button onClick={() => startRecording()}
+                    className="text-xs text-gray-600 hover:text-gray-400 border border-gray-800 hover:border-gray-600 px-2.5 py-1 rounded-lg transition">
+                    Re-record
+                  </button>
                 </div>
-                <button
-                  onClick={() => startRecording(true)}
-                  className="text-xs text-gray-600 hover:text-gray-400 border border-gray-800 hover:border-gray-600 px-2.5 py-1 rounded-lg transition"
-                >
-                  Re-record
-                </button>
+                {process.env.NODE_ENV === "development" && debugAudioUrl && (
+                  <div className="border border-yellow-900/30 rounded-lg p-3 bg-yellow-950/10">
+                    <p className="text-[10px] font-mono text-yellow-600 mb-2">[DEV] Raw recording — play to confirm remote audio captured before evaluating transcript</p>
+                    <audio src={debugAudioUrl} controls className="w-full" style={{ height: "32px" }} />
+                  </div>
+                )}
               </div>
             )}
             {recStatus === "error" && (
@@ -929,10 +902,8 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
                   <p className="text-sm text-red-400 font-medium">Recording failed</p>
                   <p className="text-xs text-gray-600 mt-0.5">{recError}</p>
                 </div>
-                <button
-                  onClick={() => startRecording(true)}
-                  className="text-xs bg-red-600 hover:bg-red-500 text-white font-semibold px-4 py-2 rounded-lg transition flex-shrink-0"
-                >
+                <button onClick={() => startRecording()}
+                  className="text-xs bg-red-600 hover:bg-red-500 text-white font-semibold px-4 py-2 rounded-lg transition flex-shrink-0">
                   Try Again
                 </button>
               </div>
@@ -940,83 +911,62 @@ export default function MeetingWorkspace({ eventId }: { eventId: string }) {
           </div>
         </div>
 
-        {/* Transcript + AI Summary — shown once recording is done */}
-        {transcript && (
-          <SummaryTab
+        {/* ── Tab content ── */}
+        {activeTab === "summary" && (
+          <SummaryTabPanel
             transcript={transcript}
             data={data}
             update={update}
-            pushTimeline={pushTimeline}
+            summaryLoading={summaryLoading}
+            summaryError={summaryError}
+            onRegenerate={() => { setSummaryError(null); if (transcript) generateSummary(transcript, true); }}
+            onEvidenceClick={handleEvidenceClick}
+            onUpdateActionItem={handleUpdateActionItem}
             recStatus={recStatus}
-            onRecord={startRecording}
+            onStartRecording={startRecording}
           />
         )}
 
-        {/* Notes */}
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-xs font-semibold text-gray-600 uppercase tracking-wider">Notes</p>
-            <span className="text-xs text-gray-700">{saved ? "Saved" : "Saving…"}</span>
-          </div>
-          <textarea
-            value={data.notes}
-            onChange={e => {
-              update({ notes: e.target.value });
-              if (!data.notes && e.target.value) pushTimeline("note_added", "Notes started");
-            }}
-            placeholder="Start typing your meeting notes…"
-            className="w-full bg-gray-900 border border-gray-800 rounded-xl p-5 text-gray-200 placeholder-gray-700 text-sm leading-relaxed resize-none outline-none focus:border-gray-700 transition min-h-[300px]"
+        {activeTab === "notes" && (
+          <NotesTabPanel
+            notes={data.notes}
+            saved={saved}
+            onChange={notes => update({ notes })}
+            onFirstNote={() => { if (!data.notes) pushTimeline("note_added", "Notes started"); }}
           />
-        </div>
+        )}
 
+        {activeTab === "transcript" && (
+          <TranscriptTabPanel
+            transcript={transcript}
+            data={data}
+            update={update}
+            highlightSegmentId={highlightSegmentId}
+            onHighlightClear={handleHighlightClear}
+          />
+        )}
       </div>
     </div>
   );
 }
 
-
-// ── Summary Tab ─────────────────────────────────────────────────────────────────
-function SummaryTab({
-  transcript, data, update, pushTimeline, recStatus, onRecord,
+// ── Summary Tab Panel ──────────────────────────────────────────────────────────
+function SummaryTabPanel({
+  transcript, data, update, summaryLoading, summaryError,
+  onRegenerate, onEvidenceClick, onUpdateActionItem, recStatus, onStartRecording,
 }: {
   transcript: RecordingResult | null;
   data: MeetingLocalData;
   update: (p: Partial<MeetingLocalData>) => void;
-  pushTimeline: (type: TimelineEvent["type"], desc: string) => void;
+  summaryLoading: boolean;
+  summaryError: string | null;
+  onRegenerate: () => void;
+  onEvidenceClick: (segmentId: string) => void;
+  onUpdateActionItem: (itemId: string, changes: Partial<GroundedActionItem>) => void;
   recStatus: string;
-  onRecord: () => void;
+  onStartRecording: () => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState<string | null>(null);
-
-  const generateSummary = async (result: RecordingResult) => {
-    setAiLoading(true);
-    setAiError(null);
-    try {
-      const res = await fetch('/api/summarize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript: result.translated_transcript, segments: result.segments }),
-      });
-      const summary = await res.json();
-      if (!res.ok) throw new Error(summary?.error || `HTTP ${res.status}`);
-      update({ aiSummary: summary });
-      pushTimeline('summary_generated', 'AI summary generated');
-    } catch (e) {
-      setAiError(e instanceof Error ? e.message : 'Failed to generate summary');
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
-  // Auto-generate when transcript arrives and no cached summary exists
-  useEffect(() => {
-    if (transcript && !data.aiSummary && !aiLoading) {
-      generateSummary(transcript);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transcript?.timestamp]);
 
   if (!transcript) {
     return (
@@ -1027,7 +977,7 @@ function SummaryTab({
           Record your meeting to get an AI-generated transcript and structured summary.
         </p>
         <button
-          onClick={onRecord}
+          onClick={onStartRecording}
           disabled={recStatus === "processing"}
           className="bg-red-600 hover:bg-red-500 text-white font-semibold px-8 py-3 rounded-xl transition disabled:opacity-50"
         >
@@ -1037,61 +987,92 @@ function SummaryTab({
     );
   }
 
-  const summary = data.aiSummary ?? parseSummary(transcript.translated_transcript);
-  const { execSummary, topics, questions, actions, risks } = summary;
+  const evidenceSummary = data.evidenceSummary;
+  const normalizedSegments = transcript.normalizedTranscript?.segments;
 
   const copyAll = () => {
-    const transcriptText = transcript.segments && transcript.segments.length > 0
-      ? transcript.segments.map(s => `Speaker ${s.speaker}: ${s.translated_text}`).join('\n')
-      : transcript.translated_transcript;
-    const text = [
-      `# Meeting Summary`,
+    const transcriptText = normalizedSegments
+      ? normalizedSegments.map(s => `${s.speakerLabel ?? "Speaker"}: ${s.translatedText}`).join("\n")
+      : transcript.segments && transcript.segments.length > 0
+        ? transcript.segments.map(s => `Speaker ${s.speaker}: ${s.translated_text}`).join("\n")
+        : transcript.translated_transcript;
+    const lines = [
+      "# Meeting Summary",
       `Language: ${transcript.input_language}`,
-      ``,
-      `## Executive Summary`,
-      execSummary,
-      ``,
-      `## Full Transcript`,
-      transcriptText,
-      data.actionItems.length ? `\n## Action Items\n${data.actionItems.map(a => `- ${a.text}${a.owner ? ` (${a.owner})` : ""}`).join("\n")}` : "",
-      data.openQuestions.length ? `\n## Open Questions\n${data.openQuestions.map(q => `- ${q}`).join("\n")}` : "",
-      data.risks.length ? `\n## Risks & Concerns\n${data.risks.map(r => `- ${r}`).join("\n")}` : "",
-    ].filter(Boolean).join("\n");
-    navigator.clipboard.writeText(text);
+      "",
+    ];
+    if (evidenceSummary) {
+      if (evidenceSummary.executiveSummary.length > 0) {
+        lines.push("## Executive Summary");
+        evidenceSummary.executiveSummary.forEach(i => lines.push(`- ${i.text}`));
+        lines.push("");
+      }
+      if (evidenceSummary.actionItems.length > 0) {
+        lines.push("## Action Items");
+        evidenceSummary.actionItems.forEach(i => {
+          let line = `- [ ] ${i.text}`;
+          if (i.owner) line += ` (Owner: ${i.owner})`;
+          if (i.dueDate) line += ` (Due: ${i.dueDate})`;
+          lines.push(line);
+        });
+        lines.push("");
+      }
+    }
+    lines.push("## Full Transcript", transcriptText);
+    navigator.clipboard.writeText(lines.join("\n"));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // Loading state
+  if (summaryLoading) {
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-12 text-center">
+          <div className="text-2xl mb-3 animate-pulse">✦</div>
+          <p className="text-gray-400 text-sm animate-pulse">Generating meeting summary…</p>
+          <p className="text-gray-600 text-xs mt-2">Claude is analysing the complete discussion</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Only show legacy summary when there's no evidence summary, no active error, and explicit prior aiSummary exists
+  const legacySummary = (!evidenceSummary && !summaryError && !summaryLoading && data.aiSummary) ? data.aiSummary : null;
+
   return (
-    <div className="flex flex-col gap-6 max-w-3xl">
+    <div className="flex flex-col gap-5">
+      {/* Error / retry */}
+      {summaryError && (
+        <div className="bg-yellow-950/30 border border-yellow-900/40 rounded-xl px-5 py-3 flex items-center justify-between gap-4">
+          <span className="text-yellow-400 text-sm">{summaryError}</span>
+          <button onClick={onRegenerate}
+            className="text-xs text-yellow-300 border border-yellow-800 hover:border-yellow-600 px-3 py-1.5 rounded-lg transition flex-shrink-0">
+            Retry Summary
+          </button>
+        </div>
+      )}
+
       {/* Actions bar */}
       <div className="flex items-center gap-2 justify-end">
-        <button
-          onClick={copyAll}
-          className="text-xs text-gray-500 hover:text-white border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded-lg transition"
-        >
-          {copied ? "Copied!" : "Copy Summary"}
+        <button onClick={copyAll}
+          className="text-xs text-gray-500 hover:text-white border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded-lg transition">
+          {copied ? "Copied!" : "Copy"}
         </button>
-        <button
-          onClick={() => {
-            update({ aiSummary: null });
-            generateSummary(transcript);
-          }}
-          disabled={aiLoading}
-          className="text-xs text-gray-500 hover:text-white border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded-lg transition disabled:opacity-50"
-        >
-          {aiLoading ? "Generating…" : "Regenerate Summary"}
+        <button onClick={onRegenerate}
+          className="text-xs text-gray-500 hover:text-white border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded-lg transition">
+          Regenerate Summary
         </button>
       </div>
 
-      {/* Language + confidence */}
+      {/* Confidence / meta chips */}
       <div className="flex items-center gap-2 flex-wrap">
         <span className="bg-gray-800 text-gray-400 text-xs px-2.5 py-1 rounded-full border border-gray-700">
           {transcript.input_language} detected
         </span>
         {transcript.confidence !== null && (
           <span className="bg-gray-800 text-gray-400 text-xs px-2.5 py-1 rounded-full border border-gray-700">
-            {Math.round(transcript.confidence * 100)}% confidence
+            {Math.round((transcript.confidence ?? 0) * 100)}% confidence
           </span>
         )}
         {transcript.low_confidence && (
@@ -1099,137 +1080,621 @@ function SummaryTab({
             Low confidence
           </span>
         )}
-        {data.aiSummary && (
+        {evidenceSummary && (
           <span className="bg-blue-900/40 text-blue-400 text-xs px-2.5 py-1 rounded-full border border-blue-800/40">
-            AI summary
+            Evidence-backed summary
           </span>
         )}
       </div>
 
-      {/* Loading state */}
-      {aiLoading && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-8 text-center">
-          <div className="text-gray-400 text-sm animate-pulse">Generating AI summary…</div>
-        </div>
-      )}
+      {/* ── Evidence-backed summary ── */}
+      {evidenceSummary && (
+        <>
+          {/* 1. Action Items — always shown */}
+          <ActionItemsSection
+            items={evidenceSummary.actionItems}
+            segments={normalizedSegments}
+            onEvidenceClick={onEvidenceClick}
+            onUpdateItem={onUpdateActionItem}
+          />
 
-      {/* Error state */}
-      {aiError && !aiLoading && (
-        <div className="bg-red-950/30 border border-red-900/40 rounded-xl px-5 py-3 text-red-400 text-sm">
-          Summary generation failed: {aiError}. Showing basic summary below.
-        </div>
-      )}
+          {/* 2. Executive Summary */}
+          {evidenceSummary.executiveSummary.length > 0 && (
+            <SummarySection title="Executive Summary" icon="📋">
+              {evidenceSummary.executiveSummary.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
 
-      {/* Executive Summary */}
-      {!aiLoading && (
-        <SummarySection title="Executive Summary" icon="📋">
-          <p className="text-gray-300 text-sm leading-relaxed">{execSummary}</p>
-        </SummarySection>
-      )}
+          {/* 3. Key Discussion Topics — structured (new records) */}
+          {(evidenceSummary.keyTopics?.length ?? 0) > 0 && (
+            <SummarySection title="Key Discussion Topics" icon="💬">
+              {evidenceSummary.keyTopics!.map(topic => (
+                <div key={topic.id} className="mb-5 last:mb-0">
+                  <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">{topic.title}</h4>
+                  {topic.items.map(item => (
+                    <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+                  ))}
+                </div>
+              ))}
+            </SummarySection>
+          )}
 
-      {/* Discussion */}
-      {!aiLoading && topics.length > 0 && (
-        <SummarySection title="Discussion" icon="💬">
-          {topics.map((topic, i) => (
-            <div key={i} className="mb-4 last:mb-0">
-              <div className="text-xs text-gray-600 uppercase tracking-wider mb-1">Topic {i + 1}</div>
-              <p className="text-gray-300 text-sm leading-relaxed">{topic}</p>
+          {/* Fall back to flat discussionPoints for old records */}
+          {!(evidenceSummary.keyTopics?.length) && evidenceSummary.discussionPoints.length > 0 && (
+            <SummarySection title="Discussion" icon="💬">
+              {evidenceSummary.discussionPoints.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
+
+          {/* 4. Decisions */}
+          {evidenceSummary.decisions.length > 0 && (
+            <SummarySection title="Decisions" icon="✅">
+              {evidenceSummary.decisions.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
+
+          {/* 5. Open Questions */}
+          {evidenceSummary.questions.length > 0 && (
+            <SummarySection title="Open Questions" icon="❓">
+              {evidenceSummary.questions.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
+
+          {/* 6. Risks & Concerns */}
+          {evidenceSummary.risks.length > 0 && (
+            <SummarySection title="Risks & Concerns" icon="⚠️">
+              {evidenceSummary.risks.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
+
+          {/* 7. Recommendations Discussed — NOT action items */}
+          {(evidenceSummary.recommendations?.length ?? 0) > 0 && (
+            <SummarySection title="Recommendations Discussed" icon="💡">
+              {evidenceSummary.recommendations!.map(item => (
+                <EvidenceItem key={item.id} item={item} segments={normalizedSegments} onNavigateToTranscript={onEvidenceClick} />
+              ))}
+            </SummarySection>
+          )}
+
+          {/* Empty state — action items section always renders, so only check content sections */}
+          {evidenceSummary.executiveSummary.length === 0 &&
+           !(evidenceSummary.keyTopics?.length) &&
+           evidenceSummary.discussionPoints.length === 0 && (
+            <div className="text-gray-600 text-sm text-center py-8 bg-gray-900 border border-gray-800 rounded-xl">
+              Nothing significant was extracted from this transcript.
             </div>
-          ))}
-        </SummarySection>
+          )}
+        </>
       )}
 
-      {/* Full Transcript — diarized if segments available, otherwise flat */}
-      <SummarySection title="Full Transcript" icon="📝">
-        {transcript.segments && transcript.segments.length > 0 ? (
-          <DiarizedTranscript segments={transcript.segments} />
-        ) : (
-          <p className="text-gray-400 text-sm leading-relaxed whitespace-pre-wrap font-mono">
-            {transcript.translated_transcript}
-          </p>
-        )}
-      </SummarySection>
-
-      {/* Action Items */}
-      <SummarySection title="Action Items" icon="⚡">
-        <EditableList
-          items={data.actionItems.map(a => a.text)}
-          placeholder="Add action item…"
-          suggestions={actions}
-          onAdd={text => {
-            update({ actionItems: [...data.actionItems, { id: uid(), text, owner: "", completed: false }] });
-            pushTimeline("action_created", `Action: "${text}"`);
-          }}
-          onRemove={i => update({ actionItems: data.actionItems.filter((_, idx) => idx !== i) })}
-        />
-      </SummarySection>
-
-      {/* Open Questions */}
-      <SummarySection title="Open Questions" icon="❓">
-        <EditableList
-          items={data.openQuestions}
-          placeholder="Add unanswered question…"
-          suggestions={questions}
-          onAdd={text => update({ openQuestions: [...data.openQuestions, text] })}
-          onRemove={i => update({ openQuestions: data.openQuestions.filter((_, idx) => idx !== i) })}
-        />
-      </SummarySection>
-
-      {/* Risks */}
-      <SummarySection title="Risks & Concerns" icon="⚠️">
-        <EditableList
-          items={data.risks}
-          placeholder="Add risk or concern…"
-          suggestions={risks}
-          onAdd={text => update({ risks: [...data.risks, text] })}
-          onRemove={i => update({ risks: data.risks.filter((_, idx) => idx !== i) })}
-        />
-      </SummarySection>
+      {/* ── Legacy flat summary (old records) ── */}
+      {!evidenceSummary && legacySummary && (
+        <>
+          {legacySummary.execSummary && (
+            <SummarySection title="Executive Summary" icon="📋">
+              <p className="text-gray-300 text-sm leading-relaxed">{legacySummary.execSummary}</p>
+            </SummarySection>
+          )}
+          {legacySummary.topics.length > 0 && (
+            <SummarySection title="Discussion" icon="💬">
+              {legacySummary.topics.map((topic, i) => (
+                <div key={i} className="mb-4 last:mb-0">
+                  <div className="text-xs text-gray-600 uppercase tracking-wider mb-1">Topic {i + 1}</div>
+                  <p className="text-gray-300 text-sm leading-relaxed">{topic}</p>
+                </div>
+              ))}
+            </SummarySection>
+          )}
+          {legacySummary.actions.length > 0 && (
+            <SummarySection title="Action Items" icon="⚡">
+              <EditableList
+                items={data.actionItems.map(a => a.text)}
+                placeholder="Add action item…"
+                suggestions={legacySummary.actions}
+                onAdd={text => { update({ actionItems: [...data.actionItems, { id: uid(), text, owner: "", completed: false }] }); }}
+                onRemove={i => update({ actionItems: data.actionItems.filter((_, idx) => idx !== i) })}
+              />
+            </SummarySection>
+          )}
+        </>
+      )}
     </div>
   );
 }
 
-const SPEAKER_COLORS = [
-  "text-blue-400", "text-green-400", "text-purple-400",
-  "text-yellow-400", "text-pink-400", "text-cyan-400",
-];
-
-function fmtTime(secs: number) {
-  const m = Math.floor(secs / 60).toString().padStart(2, "0");
-  const s = Math.floor(secs % 60).toString().padStart(2, "0");
-  return `${m}:${s}`;
+// ── Action Items Section ───────────────────────────────────────────────────────
+function ActionItemsSection({
+  items, segments, onEvidenceClick, onUpdateItem,
+}: {
+  items: GroundedActionItem[];
+  segments: TranscriptSegment[] | undefined;
+  onEvidenceClick: (segmentId: string) => void;
+  onUpdateItem: (id: string, changes: Partial<GroundedActionItem>) => void;
+}) {
+  const completedCount = items.filter(i => i.completed).length;
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      <div className="px-5 py-4 border-b border-gray-800 flex items-center gap-2">
+        <span>⚡</span>
+        <span className="font-semibold text-sm">Action Items</span>
+        {items.length > 0 && completedCount > 0 && (
+          <span className="text-xs text-gray-500 ml-1">{completedCount}/{items.length} done</span>
+        )}
+        {items.length > 0 && (
+          <span className="text-xs text-gray-600 ml-auto">{items.length} item{items.length !== 1 ? "s" : ""}</span>
+        )}
+      </div>
+      {items.length === 0 ? (
+        <div className="px-5 py-4 text-sm text-gray-600">
+          No explicit action items or commitments were detected in this meeting.
+        </div>
+      ) : (
+        <div className="divide-y divide-gray-800">
+          {items.map(item => (
+            <ActionItemRow
+              key={item.id}
+              item={item}
+              segments={segments}
+              onEvidenceClick={onEvidenceClick}
+              onUpdate={changes => onUpdateItem(item.id, changes)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
+function ActionItemRow({
+  item, segments, onEvidenceClick, onUpdate,
+}: {
+  item: GroundedActionItem;
+  segments: TranscriptSegment[] | undefined;
+  onEvidenceClick: (segmentId: string) => void;
+  onUpdate: (changes: Partial<GroundedActionItem>) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState(item.text);
+
+  const commitEdit = () => {
+    const trimmed = editText.trim();
+    if (trimmed && trimmed !== item.text) onUpdate({ text: trimmed });
+    setEditing(false);
+  };
+
+  return (
+    <div className="flex items-start gap-3 px-5 py-4 group">
+      {/* Checkbox */}
+      <button
+        onClick={() => onUpdate({ completed: !item.completed })}
+        className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition ${
+          item.completed ? "bg-green-600 border-green-600" : "border-gray-600 hover:border-gray-400"
+        }`}
+        aria-label={item.completed ? "Mark incomplete" : "Mark complete"}
+      >
+        {item.completed && <span className="text-white text-[9px] font-bold">✓</span>}
+      </button>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0">
+        {editing ? (
+          <input
+            value={editText}
+            onChange={e => setEditText(e.target.value)}
+            onBlur={commitEdit}
+            onKeyDown={e => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") { setEditText(item.text); setEditing(false); } }}
+            className="w-full bg-transparent text-sm text-gray-200 outline-none border-b border-gray-600 pb-0.5"
+            autoFocus
+          />
+        ) : (
+          <p
+            className={`text-sm leading-relaxed cursor-text ${item.completed ? "line-through text-gray-600" : "text-gray-200"}`}
+            onClick={() => { setEditText(item.text); setEditing(true); }}
+          >
+            {item.text}
+          </p>
+        )}
+
+        {(item.owner || item.dueDate) && (
+          <div className="flex items-center gap-3 mt-1">
+            {item.owner && <span className="text-xs text-blue-400">Owner: {item.owner}</span>}
+            {item.dueDate && <span className="text-xs text-gray-500">Due: {item.dueDate}</span>}
+          </div>
+        )}
+
+        {/* Evidence chips */}
+        {item.evidenceSegmentIds.length > 0 && (
+          <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+            {item.evidenceSegmentIds.map(segId => {
+              const seg = segments?.find(s => s.segmentId === segId);
+              const num = segId.replace(/^S0*/, "") || segId;
+              return (
+                <button
+                  key={segId}
+                  onClick={() => onEvidenceClick(segId)}
+                  title={seg ? `"${seg.translatedText.slice(0, 120)}${seg.translatedText.length > 120 ? "…" : ""}"` : segId}
+                  className="text-[10px] font-mono text-gray-600 hover:text-blue-400 bg-gray-800 hover:bg-gray-700 px-1.5 py-0.5 rounded transition"
+                >
+                  [{num}]
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {item.verificationStatus === "needs_review" && (
+          <span className="text-[10px] text-yellow-600 mt-1 block">Needs review</span>
+        )}
+      </div>
+
+      {/* Delete */}
+      <button
+        onClick={() => onUpdate({ text: "" })}
+        className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-red-400 transition text-xs flex-shrink-0 mt-0.5"
+        title="Remove action item"
+        aria-label="Remove action item"
+      >×</button>
+    </div>
+  );
+}
+
+// ── Notes Tab Panel ────────────────────────────────────────────────────────────
+function NotesTabPanel({
+  notes, saved, onChange, onFirstNote,
+}: {
+  notes: string;
+  saved: boolean;
+  onChange: (notes: string) => void;
+  onFirstNote?: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-end">
+        <span className="text-xs text-gray-700">{saved ? "Saved" : "Saving…"}</span>
+      </div>
+      <textarea
+        value={notes}
+        onChange={e => {
+          if (!notes && e.target.value) onFirstNote?.();
+          onChange(e.target.value);
+        }}
+        placeholder="Start typing your meeting notes…"
+        className="w-full bg-gray-900 border border-gray-800 rounded-xl p-5 text-gray-200 placeholder-gray-700 text-sm leading-relaxed resize-none outline-none focus:border-gray-700 transition min-h-[400px]"
+      />
+    </div>
+  );
+}
+
+// ── Transcript Tab Panel ───────────────────────────────────────────────────────
+function TranscriptTabPanel({
+  transcript, data, update, highlightSegmentId, onHighlightClear,
+}: {
+  transcript: RecordingResult | null;
+  data: MeetingLocalData;
+  update: (p: Partial<MeetingLocalData>) => void;
+  highlightSegmentId: string | null;
+  onHighlightClear: () => void;
+}) {
+  const [search, setSearch] = useState("");
+  const segmentRefs = useRef<{ [id: string]: HTMLDivElement | null }>({});
+
+  // Scroll to highlighted segment on mount or when highlight changes
+  useEffect(() => {
+    if (!highlightSegmentId) return;
+    const el = segmentRefs.current[highlightSegmentId];
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      const t = setTimeout(onHighlightClear, 2500);
+      return () => clearTimeout(t);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightSegmentId]);
+
+  if (!transcript) {
+    return (
+      <div className="text-center py-16">
+        <div className="text-4xl mb-4">📄</div>
+        <p className="text-gray-500 text-sm">No transcript yet. Record a meeting to generate a transcript.</p>
+      </div>
+    );
+  }
+
+  const normalizedSegments = transcript.normalizedTranscript?.segments;
+
+  const filteredSegments = normalizedSegments?.filter(seg =>
+    !search || seg.translatedText.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const uniqueSpeakers = normalizedSegments
+    ? Array.from(new Set(normalizedSegments.map(s => s.speakerLabel).filter((s): s is string => !!s))).sort()
+    : [];
+
+  const handleSpeakerRename = (providerLabel: string, confirmedName: string) => {
+    const existing = data.speakerMappings ?? [];
+    const without = existing.filter(m => m.providerLabel !== providerLabel);
+    update({ speakerMappings: [...without, { providerLabel, confirmedName: confirmedName.trim() || null }] });
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Search */}
+      <div className="flex items-center gap-3">
+        <input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search transcript…"
+          className="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm text-gray-300 placeholder-gray-700 outline-none focus:border-gray-600 transition"
+        />
+        {search && (
+          <button onClick={() => setSearch("")}
+            className="text-xs text-gray-600 hover:text-gray-300 transition">
+            Clear
+          </button>
+        )}
+        {normalizedSegments && search && (
+          <span className="text-xs text-gray-600">
+            {filteredSegments?.length ?? 0} / {normalizedSegments.length} segments
+          </span>
+        )}
+      </div>
+
+      {/* Speaker legend with rename */}
+      {uniqueSpeakers.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {uniqueSpeakers.map((label, i) => (
+            <SpeakerChip
+              key={label}
+              providerLabel={label}
+              colorClass={SPEAKER_COLORS[i % SPEAKER_COLORS.length]}
+              speakerMappings={data.speakerMappings}
+              onRename={handleSpeakerRename}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Transcript segments */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        {normalizedSegments ? (
+          filteredSegments && filteredSegments.length > 0 ? (
+            <NormalizedTranscriptView
+              segments={filteredSegments}
+              speakerMappings={data.speakerMappings}
+              highlightSegmentId={highlightSegmentId}
+              segmentRefs={segmentRefs}
+              searchTerm={search}
+            />
+          ) : (
+            <div className="px-5 py-8 text-center text-sm text-gray-600">
+              {search ? `No segments matching "${search}"` : "No segments to display."}
+            </div>
+          )
+        ) : transcript.segments && transcript.segments.length > 0 ? (
+          <DiarizedTranscript segments={transcript.segments} />
+        ) : (
+          <div className="p-5">
+            <p className="text-gray-400 text-sm leading-relaxed whitespace-pre-wrap font-mono">
+              {transcript.translated_transcript}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Language + confidence footer */}
+      <div className="flex items-center gap-3 text-xs text-gray-600">
+        <span>Language: {transcript.input_language}</span>
+        {transcript.confidence !== null && (
+          <span>· {Math.round((transcript.confidence ?? 0) * 100)}% confidence</span>
+        )}
+        {transcript.low_confidence && <span className="text-yellow-600">· Low confidence — review recommended</span>}
+        {normalizedSegments && (
+          <span>· {normalizedSegments.length} segments</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Speaker chip with rename ───────────────────────────────────────────────────
+function SpeakerChip({
+  providerLabel, colorClass, speakerMappings, onRename,
+}: {
+  providerLabel: string;
+  colorClass: string;
+  speakerMappings: MeetingLocalData["speakerMappings"];
+  onRename: (label: string, name: string) => void;
+}) {
+  const mapping = speakerMappings?.find(m => m.providerLabel === providerLabel);
+  const displayName = mapping?.confirmedName ?? providerLabel;
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(displayName);
+
+  const commit = () => {
+    onRename(providerLabel, value);
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div className={`flex items-center gap-1 bg-gray-800 border border-gray-600 rounded-full px-3 py-1 ${colorClass}`}>
+        <input
+          value={value}
+          onChange={e => setValue(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
+          onBlur={commit}
+          className="bg-transparent text-xs outline-none w-24"
+          autoFocus
+        />
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={() => { setValue(displayName); setEditing(true); }}
+      className={`text-xs font-medium px-3 py-1 rounded-full bg-gray-800 border border-gray-700 hover:border-gray-500 transition ${colorClass}`}
+      title="Click to rename speaker"
+    >
+      {displayName}
+      {mapping?.confirmedName && <span className="text-gray-600 ml-1 text-[9px]">({providerLabel})</span>}
+      <span className="text-gray-600 ml-1.5 text-[9px]">✏</span>
+    </button>
+  );
+}
+
+// ── Evidence item ──────────────────────────────────────────────────────────────
+function EvidenceItem({
+  item, segments, onNavigateToTranscript, children,
+}: {
+  item: GroundedSummaryItem;
+  segments: TranscriptSegment[] | undefined;
+  onNavigateToTranscript: (segmentId: string) => void;
+  children?: React.ReactNode;
+}) {
+  const statusCfg = {
+    supported:           { cls: "text-green-500",  label: "✓" },
+    partially_supported: { cls: "text-yellow-500", label: "~" },
+    needs_review:        { cls: "text-yellow-400", label: "?" },
+    unsupported:         { cls: "text-red-400",    label: "✗" },
+  }[item.verificationStatus] ?? { cls: "text-gray-500", label: "?" };
+
+  return (
+    <div className="flex items-start gap-2 mb-3 last:mb-0">
+      <span className={`mt-1 text-[11px] flex-shrink-0 ${statusCfg.cls}`} title={item.verificationStatus}>
+        {statusCfg.label}
+      </span>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm text-gray-200 leading-relaxed">{item.text}</p>
+        {children && <div className="flex flex-col mt-1">{children}</div>}
+        {/* Evidence chips — click to navigate to Transcript tab */}
+        {item.evidenceSegmentIds.length > 0 && (
+          <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+            {item.evidenceSegmentIds.map(segId => {
+              const seg = segments?.find(s => s.segmentId === segId);
+              const num = segId.replace(/^S0*/, "") || segId;
+              return (
+                <button
+                  key={segId}
+                  onClick={() => onNavigateToTranscript(segId)}
+                  title={seg ? `"${seg.translatedText.slice(0, 120)}${seg.translatedText.length > 120 ? "…" : ""}"` : `Go to ${segId}`}
+                  className="text-[10px] font-mono text-gray-600 hover:text-blue-400 bg-gray-800 hover:bg-gray-700 px-1.5 py-0.5 rounded transition"
+                >
+                  [{num}]
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Normalized transcript view ─────────────────────────────────────────────────
+function NormalizedTranscriptView({
+  segments, speakerMappings, highlightSegmentId, segmentRefs, searchTerm,
+}: {
+  segments: TranscriptSegment[];
+  speakerMappings: MeetingLocalData["speakerMappings"];
+  highlightSegmentId: string | null;
+  segmentRefs: React.MutableRefObject<{ [id: string]: HTMLDivElement | null }>;
+  searchTerm?: string;
+}) {
+  const speakers = Array.from(new Set(segments.map(s => s.speakerLabel).filter((s): s is string => !!s))).sort();
+  const colorMap = Object.fromEntries(speakers.map((sp, i) => [sp, SPEAKER_COLORS[i % SPEAKER_COLORS.length]]));
+
+  const getDisplayName = (label: string) => {
+    const mapping = speakerMappings?.find(m => m.providerLabel === label);
+    return mapping?.confirmedName ?? label;
+  };
+
+  const renderText = (text: string) => {
+    if (!searchTerm) return <>{text}</>;
+    const idx = text.toLowerCase().indexOf(searchTerm.toLowerCase());
+    if (idx < 0) return <>{text}</>;
+    return (
+      <>
+        {text.slice(0, idx)}
+        <mark className="bg-yellow-500/30 text-yellow-200 rounded">{text.slice(idx, idx + searchTerm.length)}</mark>
+        {text.slice(idx + searchTerm.length)}
+      </>
+    );
+  };
+
+  return (
+    <div className="flex flex-col divide-y divide-gray-800">
+      {segments.map(seg => {
+        const isHighlighted = seg.segmentId === highlightSegmentId;
+        return (
+          <div
+            key={seg.segmentId}
+            ref={el => { segmentRefs.current[seg.segmentId] = el; }}
+            id={`seg-${seg.segmentId}`}
+            className={`flex gap-3 items-start px-5 py-3 transition-colors duration-300 ${
+              isHighlighted
+                ? "bg-blue-950/40 border-l-2 border-blue-500 -ml-0.5"
+                : "hover:bg-gray-800/20"
+            }`}
+          >
+            <span className="text-[10px] font-mono text-gray-600 mt-0.5 flex-shrink-0 w-10 text-right pt-0.5">
+              {fmtTime(seg.startSeconds)}
+            </span>
+            <div className="flex-1 min-w-0">
+              {seg.speakerLabel && (
+                <div className={`text-xs font-semibold mb-0.5 ${colorMap[seg.speakerLabel] ?? "text-gray-400"}`}>
+                  {getDisplayName(seg.speakerLabel)}
+                </div>
+              )}
+              <p className={`text-sm leading-relaxed ${seg.reviewRequired ? "text-yellow-300" : "text-gray-300"}`}>
+                {renderText(seg.translatedText)}
+              </p>
+              <div className="flex items-center gap-2 mt-0.5">
+                <span className="text-[9px] font-mono text-gray-700">{seg.segmentId}</span>
+                {seg.reviewRequired && <span className="text-[10px] text-yellow-600">Low confidence</span>}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Legacy diarized transcript ─────────────────────────────────────────────────
 function DiarizedTranscript({ segments }: { segments: DiarizationSegment[] }) {
   const speakers = Array.from(new Set(segments.map(s => s.speaker))).sort();
   const colorMap = Object.fromEntries(speakers.map((sp, i) => [sp, SPEAKER_COLORS[i % SPEAKER_COLORS.length]]));
 
   return (
-    <div className="flex flex-col gap-3">
-      {/* Speaker legend */}
-      <div className="flex flex-wrap gap-2 mb-1">
-        {speakers.map(sp => (
-          <span key={sp} className={`text-xs font-medium px-2 py-0.5 rounded-full bg-gray-800 border border-gray-700 ${colorMap[sp]}`}>
-            Speaker {sp}
-          </span>
-        ))}
-      </div>
-      {/* Segments */}
+    <div className="flex flex-col divide-y divide-gray-800">
       {segments.map((seg, i) => (
-        <div key={i} className="flex gap-3 items-start">
-          <span className={`text-[10px] font-mono text-gray-600 mt-0.5 flex-shrink-0 w-10 text-right`}>
+        <div key={i} className="flex gap-3 items-start px-5 py-3">
+          <span className="text-[10px] font-mono text-gray-600 mt-0.5 flex-shrink-0 w-10 text-right">
             {fmtTime(seg.start_time)}
           </span>
-          <span className={`text-xs font-semibold flex-shrink-0 w-16 ${colorMap[seg.speaker]}`}>
-            Spkr {seg.speaker}
-          </span>
-          <p className="text-gray-300 text-sm leading-relaxed">{seg.translated_text}</p>
+          <div className="flex-1 min-w-0">
+            <div className={`text-xs font-semibold mb-0.5 ${colorMap[seg.speaker]}`}>
+              Speaker {seg.speaker}
+            </div>
+            <p className="text-gray-300 text-sm leading-relaxed">{seg.translated_text}</p>
+          </div>
         </div>
       ))}
     </div>
   );
 }
 
+// ── Summary section wrapper ────────────────────────────────────────────────────
 function SummarySection({ title, icon, children }: { title: string; icon: string; children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   return (
@@ -1249,62 +1714,7 @@ function SummarySection({ title, icon, children }: { title: string; icon: string
   );
 }
 
-// ── Audio source status panel ──────────────────────────────────────────────────
-function AudioSourcePanel({
-  micStatus, meetingAudioStatus, micLevel, meetingLevel,
-}: {
-  micStatus: AudioSourceStatus;
-  meetingAudioStatus: AudioSourceStatus;
-  micLevel: number;
-  meetingLevel: number;
-}) {
-  return (
-    <div className="bg-gray-800/40 border border-gray-700/50 rounded-lg px-4 py-3">
-      <p className="text-[10px] font-semibold text-gray-600 uppercase tracking-wider mb-2">Audio Sources</p>
-      <div className="flex flex-col gap-2">
-        <AudioSourceRow label="Microphone"    status={micStatus}          level={micLevel} />
-        <AudioSourceRow label="Meeting Audio" status={meetingAudioStatus} level={meetingLevel} />
-      </div>
-    </div>
-  );
-}
-
-function AudioSourceRow({ label, status, level }: { label: string; status: AudioSourceStatus; level: number }) {
-  const cfg: Record<AudioSourceStatus, { text: string; cls: string }> = {
-    idle:         { text: "—",              cls: "text-gray-600"  },
-    connected:    { text: "Connected",      cls: "text-green-400" },
-    muted:        { text: "Muted",          cls: "text-yellow-400"},
-    not_shared:   { text: "Not shared",     cls: "text-gray-600"  },
-    no_audio:     { text: "No audio track", cls: "text-yellow-500"},
-    disconnected: { text: "Disconnected",   cls: "text-red-400"   },
-    denied:       { text: "Access denied",  cls: "text-red-400"   },
-    error:        { text: "Error",          cls: "text-red-400"   },
-  };
-  const { text, cls } = cfg[status] ?? cfg.idle;
-  const isActive = status === "connected" || status === "muted";
-
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-xs text-gray-500">{label}</span>
-      <div className="flex items-center gap-2">
-        {/* Simple level bar — only when source is connected */}
-        {isActive && (
-          <div className="flex items-end gap-px h-3">
-            {[0.15, 0.35, 0.55, 0.75].map((threshold, i) => (
-              <div
-                key={i}
-                className={`w-1 rounded-sm transition-all duration-100 ${level > threshold ? "bg-green-400" : "bg-gray-700"}`}
-                style={{ height: `${(i + 1) * 25}%` }}
-              />
-            ))}
-          </div>
-        )}
-        <span className={`text-xs font-medium ${cls}`}>{text}</span>
-      </div>
-    </div>
-  );
-}
-
+// ── Editable list ──────────────────────────────────────────────────────────────
 function EditableList({
   items, placeholder, suggestions, onAdd, onRemove,
 }: {
@@ -1315,17 +1725,13 @@ function EditableList({
   onRemove: (i: number) => void;
 }) {
   const [text, setText] = useState("");
-
   const add = () => { if (!text.trim()) return; onAdd(text.trim()); setText(""); };
 
   return (
     <div className="flex flex-col gap-2">
       {suggestions.filter(s => !items.includes(s)).slice(0, 3).map((s, i) => (
-        <button
-          key={i}
-          onClick={() => onAdd(s)}
-          className="text-left text-xs text-gray-600 hover:text-gray-300 border border-dashed border-gray-800 hover:border-gray-600 rounded-lg px-3 py-2 transition"
-        >
+        <button key={i} onClick={() => onAdd(s)}
+          className="text-left text-xs text-gray-600 hover:text-gray-300 border border-dashed border-gray-800 hover:border-gray-600 rounded-lg px-3 py-2 transition">
           + {s}
         </button>
       ))}
@@ -1333,12 +1739,8 @@ function EditableList({
         <div key={i} className="flex items-start gap-2 group">
           <span className="text-gray-400 mt-0.5 flex-shrink-0">•</span>
           <span className="text-sm text-gray-300 flex-1">{item}</span>
-          <button
-            onClick={() => onRemove(i)}
-            className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100 transition text-xs flex-shrink-0"
-          >
-            ×
-          </button>
+          <button onClick={() => onRemove(i)}
+            className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100 transition text-xs flex-shrink-0">×</button>
         </div>
       ))}
       <div className="flex gap-2 mt-1">
@@ -1349,15 +1751,11 @@ function EditableList({
           placeholder={placeholder}
           className="flex-1 bg-transparent border-b border-gray-800 focus:border-gray-600 text-sm text-gray-300 placeholder-gray-700 outline-none py-1 transition"
         />
-        <button
-          onClick={add}
-          disabled={!text.trim()}
-          className="text-xs text-gray-600 hover:text-white disabled:opacity-30 transition"
-        >
+        <button onClick={add} disabled={!text.trim()}
+          className="text-xs text-gray-600 hover:text-white disabled:opacity-30 transition">
           Add
         </button>
       </div>
     </div>
   );
 }
-

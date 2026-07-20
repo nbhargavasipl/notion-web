@@ -50,26 +50,29 @@ npm run dev
 ### Environment Variables (`.env.local`)
 
 ```env
-NEXT_PUBLIC_FIREBASE_API_KEY=AIzaSyBDcZLJcVh1p2kJ38XlrnxkL-ll021m3Gk
-NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=speech-to-text-api-eos.firebaseapp.com
-NEXT_PUBLIC_FIREBASE_PROJECT_ID=speech-to-text-api-eos
+NEXT_PUBLIC_FIREBASE_API_KEY=<from Firebase console → Project Settings → Your apps>
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=mosaic-502711.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=mosaic-502711
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
-TRANSCRIPTION_API_URL=https://speech-transcriber-222316825536.asia-south1.run.app
-TRANSCRIPTION_MASTER_KEY=testkey123
+TRANSCRIPTION_API_URL=<transcription proxy URL>
+TRANSCRIPTION_MASTER_KEY=<master key — never commit>
+GEMINI_API_KEY=<from aistudio.google.com/apikey — never commit>
 ```
 
-- `sa-key.json` is the Firebase service account key — lives at `/Users/nidhibhargava/Documents/GitHub/notion-web/sa-key.json`
+See `.env.example` for the full list of required variables.
+
+- `sa-key.json` is the service account key for `mosaic-sa@mosaic-502711` — gitignored, never commit
 - `GOOGLE_APPLICATION_CREDENTIALS` is server-side only (Firebase Admin SDK)
-- `NEXT_PUBLIC_*` vars are exposed to the browser
+- `NEXT_PUBLIC_*` vars are exposed to the browser (Firebase config only — no credentials)
 
-### Firebase Project
+### Firebase / GCP Project
 
-- **Project ID:** `speech-to-text-api-eos`
-- **Project Number:** `222316825536`
-- **OAuth Client ID:** `222316825536-vs5qu3ob08jfvalh96goe8q92b0al3jj.apps.googleusercontent.com`
-- **Auth domain:** `speech-to-text-api-eos.firebaseapp.com`
-- **Authorized domains:** `localhost`, `speech-to-text-api-eos.firebaseapp.com`
-- **Google APIs enabled:** Firebase Auth, Firestore, Google Calendar API
+- **Project ID:** `mosaic-502711`
+- **Project Number:** `273588842399`
+- **Service account:** `mosaic-sa@mosaic-502711.iam.gserviceaccount.com`
+- **Auth domain:** `mosaic-502711.firebaseapp.com`
+- **Authorized domains:** `localhost`, `mosaic-502711.firebaseapp.com`
+- **Google APIs enabled:** Firebase Auth, Firestore, Cloud Run, Generative Language API, GCS
 
 ---
 
@@ -164,11 +167,11 @@ All meeting workspace data is stored in `localStorage` under `mosaic_meeting_{ev
 - **Mic only** (yellow badge) = user cancelled screen share — only local voice
 
 ### Transcription service
-- URL: `https://speech-transcriber-222316825536.asia-south1.run.app`
+- URL: set via `TRANSCRIPTION_API_URL` in `.env.local`
 - Auth: `X-API-Key` header with master key
 - Request: multipart form with `file` field
 - Response: `{ success, input_language, translated_transcript, confidence, low_confidence }`
-- Source code: `/Users/nidhibhargava/Documents/GitHub/Notion/Main.py` (Cloud Run function)
+- Source code: `MOSAIC-Transcript/main.py` (Cloud Run service, deployed to `mosaic-502711`)
 
 ---
 
@@ -258,7 +261,7 @@ npm run tauri dev
 
 **Location:** `/Users/nidhibhargava/Documents/GitHub/MOSAIC/MOSAIC-Transcript/`
 
-**Deployed at:** `https://speech-transcriber-222316825536.asia-south1.run.app`
+**Deployed at:** See `TRANSCRIPTION_API_URL` in `.env.local`
 
 **What it does:** Accepts audio file upload (LINEAR16 WAV preferred, also handles webm), auto-detects language among 8 Indian languages + English via Google Cloud Speech-to-Text, translates to English via Google Cloud Translation.
 
@@ -274,9 +277,9 @@ gcloud builds submit --config cloudbuild.yaml
 
 | Thing | Value |
 |-------|-------|
-| Web app (local) | http://localhost:3001 (or 3000) |
-| Firebase console | console.firebase.google.com → project `speech-to-text-api-eos` |
-| GCP console | console.cloud.google.com → project `speech-to-text-api-eos` |
-| Transcription API | https://speech-transcriber-222316825536.asia-south1.run.app |
-| Service account | 222316825536-compute@developer.gserviceaccount.com |
-| OAuth client | 222316825536-vs5qu3ob08jfvalh96goe8q92b0al3jj.apps.googleusercontent.com |
+| Web app (local) | http://localhost:3002 |
+| Firebase console | console.firebase.google.com → project `mosaic-502711` |
+| GCP console | console.cloud.google.com → project `mosaic-502711` |
+| Transcription API | Set in `TRANSCRIPTION_API_URL` env var |
+| Service account | `mosaic-sa@mosaic-502711.iam.gserviceaccount.com` |
+| GCS bucket | `mosaic-recordings-mosaic-502711` |

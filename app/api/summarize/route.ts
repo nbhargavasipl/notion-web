@@ -1,72 +1,140 @@
-import { NextResponse } from 'next/server'
-import { getSession } from '@/lib/firebase/session'
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import { NextResponse } from "next/server";
+import { getSession } from "@/lib/firebase/session";
+import { getServerConfig } from "@/lib/config/server";
+import { createSummaryProvider, logUsage } from "@/lib/providers/factory";
+import { categorizeProviderError, USER_FACING_FAILURE_MESSAGES } from "@/lib/providers/types";
+import type { NormalizedTranscript, EvidenceBackedSummary } from "@/lib/providers/types";
 
-interface Segment { speaker: string; translated_text: string }
+interface SummarizeBody {
+  /** New path: full normalized transcript with segment IDs */
+  normalizedTranscript?: NormalizedTranscript;
+  /** Legacy path: flat transcript string (old recordings without segments) */
+  transcript?: string;
+  segments?: Array<{ speaker: string; translated_text: string }>;
+  meetingTitle?: string;
+  meetingId?: string;
+}
 
-function buildTranscriptText(transcript: string, segments?: Segment[]): string {
+/** Build a minimal NormalizedTranscript from a flat legacy transcript string. */
+function legacyTranscriptToNormalized(text: string, segments?: SummarizeBody["segments"]): NormalizedTranscript {
+  const now = new Date().toISOString();
+
   if (segments && segments.length > 0) {
-    return segments.map(s => `Speaker ${s.speaker}: ${s.translated_text}`).join('\n')
+    return {
+      provider: "legacy",
+      providerModel: "unknown",
+      detectedLanguage: "Unknown",
+      durationSeconds: null,
+      fullText: segments.map(s => s.translated_text).join(" "),
+      originalFullText: segments.map(s => s.translated_text).join(" "),
+      segments: segments.map((seg, i) => ({
+        segmentId: `S${String(i + 1).padStart(3, "0")}`,
+        speakerLabel: `Speaker ${seg.speaker}`,
+        startSeconds: 0,
+        endSeconds: 0,
+        text: seg.translated_text,
+        translatedText: seg.translated_text,
+        confidence: null,
+        reviewRequired: false,
+      })),
+      processingMetadata: { startedAt: now, completedAt: now, confidenceAvailable: false, diarizationAvailable: true },
+    };
   }
-  return transcript
+
+  return {
+    provider: "legacy",
+    providerModel: "unknown",
+    detectedLanguage: "Unknown",
+    durationSeconds: null,
+    fullText: text,
+    originalFullText: text,
+    segments: [
+      {
+        segmentId: "S001",
+        speakerLabel: null,
+        startSeconds: 0,
+        endSeconds: 0,
+        text,
+        translatedText: text,
+        confidence: null,
+        reviewRequired: false,
+      },
+    ],
+    processingMetadata: { startedAt: now, completedAt: now, confidenceAvailable: false, diarizationAvailable: false },
+  };
 }
-
-const PROMPT = (transcriptText: string, hasSpeakers: boolean) => `
-You are a meeting analyst. Analyze this meeting transcript and return a JSON object with exactly this structure:
-
-{
-  "execSummary": "2-3 sentence executive summary of the meeting",
-  "topics": ["topic 1 discussed", "topic 2 discussed"],
-  "actions": ["action item 1 (with speaker/owner if identifiable)", "action item 2"],
-  "questions": ["open question 1", "open question 2"],
-  "risks": ["risk or concern 1", "risk or concern 2"]
-}
-
-Rules:
-- execSummary: concise paragraph summarizing key outcomes
-- topics: main discussion areas (2-5 items)
-- actions: concrete next steps${hasSpeakers ? ', attribute to the speaker who committed (e.g. "Speaker 1 will...")' : ' with owners if mentioned'} (may be empty [])
-- questions: unresolved questions raised (may be empty [])
-- risks: blockers, concerns, or dependencies (may be empty [])
-- Return ONLY valid JSON, no markdown, no explanation
-
-Transcript:
-${transcriptText}
-`.trim()
 
 export async function POST(request: Request) {
-  const session = await getSession()
-  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await getSession();
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) {
-    return NextResponse.json({ error: 'Gemini API key not configured' }, { status: 503 })
-  }
-
-  const body = await request.json() as { transcript: string; segments?: Segment[] }
-  if (!body.transcript?.trim()) {
-    return NextResponse.json({ error: 'transcript is required' }, { status: 400 })
-  }
-
-  const hasSpeakers = !!(body.segments && body.segments.length > 0)
-  const transcriptText = buildTranscriptText(body.transcript, body.segments)
-
-  const genAI = new GoogleGenerativeAI(apiKey)
-  const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
-
+  let cfg;
   try {
-    const result = await model.generateContent(PROMPT(transcriptText, hasSpeakers))
-    const text = result.response.text().trim()
-    const json = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim()
-    const summary = JSON.parse(json)
-    return NextResponse.json(summary)
-  } catch (e: unknown) {
-    const msg: string = e instanceof Error ? e.message : ''
-    const friendly = msg.includes('prepayment') || msg.includes('credits')
-      ? 'Gemini API credits depleted — top up at aistudio.google.com'
-      : msg.includes('quota') || msg.includes('429')
-      ? 'Gemini API rate limit hit — try again in a moment'
-      : msg || 'Failed to generate summary'
-    return NextResponse.json({ error: friendly }, { status: 502 })
+    cfg = getServerConfig();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Configuration error";
+    console.error("[summarize] Config error:", msg);
+    return NextResponse.json(
+      { error: "Service not configured correctly.", failureCategory: "configuration_error" },
+      { status: 503 }
+    );
   }
+
+  const body = (await request.json()) as SummarizeBody;
+  const meetingId = body.meetingId ?? "unknown";
+
+  // Resolve transcript — prefer new normalized format, fall back to legacy
+  let transcript: NormalizedTranscript;
+  if (body.normalizedTranscript) {
+    transcript = body.normalizedTranscript;
+  } else if (body.transcript?.trim()) {
+    transcript = legacyTranscriptToNormalized(body.transcript, body.segments);
+  } else {
+    return NextResponse.json({ error: "transcript is required" }, { status: 400 });
+  }
+
+  const provider = createSummaryProvider();
+  const providerModel = cfg.providers.summary === "claude" ? cfg.claude.summaryModel : cfg.gemini.summaryModel;
+
+  let summary: EvidenceBackedSummary;
+  try {
+    summary = await provider.summarize({
+      transcript,
+      meetingTitle: body.meetingTitle,
+    });
+  } catch (err: unknown) {
+    const category =
+      (err as { failureCategory?: string }).failureCategory
+        ? ((err as { failureCategory: string }).failureCategory as ReturnType<typeof categorizeProviderError>)
+        : categorizeProviderError(err);
+    const userMessage = USER_FACING_FAILURE_MESSAGES[category];
+    const technical = (err as { technicalDetail?: string }).technicalDetail ?? (err instanceof Error ? err.message : String(err));
+
+    console.error("[summarize] Provider error:", { category, provider: provider.providerName, technical });
+
+    logUsage({
+      meetingId,
+      operation: "summary",
+      provider: provider.providerName,
+      model: providerModel,
+      status: "summary_failed",
+      failureCategory: category,
+    });
+
+    return NextResponse.json(
+      { error: userMessage, failureCategory: category },
+      { status: 502 }
+    );
+  }
+
+  logUsage({
+    meetingId,
+    operation: "summary",
+    provider: provider.providerName,
+    model: summary.providerModel,
+    status: "completed",
+    failureCategory: null,
+  });
+
+  return NextResponse.json(summary);
 }

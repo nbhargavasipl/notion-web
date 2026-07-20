@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { Storage } from '@google-cloud/storage'
 import { getSession } from '@/lib/firebase/session'
+import { getServerConfig } from '@/lib/config/server'
 
 const storage = new Storage()
 
@@ -8,7 +9,7 @@ export async function POST(request: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const bucket = process.env.GCS_RECORDINGS_BUCKET
+  const bucket = getServerConfig().keys.gcsBucket
   if (!bucket) return NextResponse.json({ error: 'GCS not configured' }, { status: 503 })
 
   let meetingId: string, chunkIndex: number, mimeType: string

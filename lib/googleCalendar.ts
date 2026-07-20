@@ -40,7 +40,9 @@ export async function fetchUpcomingMeetings(accessToken: string): Promise<Calend
   if (res.status === 401) throw new Error('TOKEN_EXPIRED');
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(`Calendar API ${res.status}: ${body?.error?.message ?? 'unknown'}`);
+    const msg = body?.error?.message ?? 'unknown';
+    if (res.status === 403 && msg.toLowerCase().includes('insufficient')) throw new Error('SCOPE_MISSING');
+    throw new Error(`Calendar API ${res.status}: ${msg}`);
   }
 
   const data = await res.json();

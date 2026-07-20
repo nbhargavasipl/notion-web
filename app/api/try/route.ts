@@ -1,10 +1,12 @@
 import { NextResponse } from 'next/server'
+import { getServerConfig } from '@/lib/config/server'
 
 const MAX_BYTES = 3 * 1024 * 1024 // 3 MB ≈ 30 s for most formats
 
 export async function POST(request: Request) {
-  const apiUrl = process.env.TRANSCRIPTION_API_URL
-  const apiKey = process.env.TRANSCRIPTION_MASTER_KEY
+  const cfg    = getServerConfig()
+  const apiUrl = cfg.keys.transcriptionApiUrl
+  const apiKey = cfg.keys.transcriptionMasterKey
 
   if (!apiUrl || !apiKey) {
     return NextResponse.json({ error: 'Service not configured' }, { status: 503 })
